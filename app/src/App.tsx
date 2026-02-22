@@ -3,7 +3,6 @@ import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import {
   Connection,
-  PublicKey,
   Transaction,
   TransactionInstruction,
   SystemProgram,
@@ -15,159 +14,25 @@ import { BackgroundMusic } from "./BackgroundMusic";
 import { useMoveSound } from "./useMoveSound";
 import { useKingPowerSound } from "./useKingPowerSound";
 import { useEmergencyCountdownSound } from "./useEmergencyCountdownSound";
-
-// Must match the program used by the relayer (from target/idl or KING_TILES_PROGRAM_ID)
-const PROGRAM_ID = new PublicKey(
-  typeof process !== "undefined" && process.env?.REACT_APP_PROGRAM_ID
-    ? process.env.REACT_APP_PROGRAM_ID
-    : "39mbUDtnBeDfF5ozhTtVgQYWudeDPoDx6HnBEVtvpgGG"
-);
-const TREASURY_PUBKEY = new PublicKey(
-  "86uKSrcwj3j6gaSkK5Ggvt4ni5rokpBhrk2X2jUjDUoA"
-);
-//for fallback only
-const GAME_ID = 5;
-const BOARD_SIZE = 144;
-const COLS = 12;
-const RELAYER_URL = "http://localhost:8787";
-const ER_ENDPOINT = "https://devnet.magicblock.app/";
-const MEMO_PROGRAM_ID = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
-
-const EMPTY = 0;
-const KING_MARK = 5;
-const REGISTRATION_FEE_LAMPORTS = 1_000_000; // 0.001 SOL
-const MAKE_MOVE_DISCRIMINATOR = [78, 77, 152, 203, 222, 211, 208, 233];
-const REGISTER_PLAYER_DISCRIMINATOR = [242, 146, 194, 234, 234, 145, 228, 42];
-
-const PLAYER_COLORS = ["#4FC3F7", "#EF5350", "#66BB6A", "#FFA726"];
-const PLAYER_LABELS = ["P1", "P2", "P3", "P4"];
-
-// Pre-computed positions so Math.random() isn't called on every render
-const COIN_X_POSITIONS = Array.from({ length: 15 }, (_, i) =>
-  parseFloat((10 + (i * 5.4) % 78).toFixed(1))
-);
-
-interface PlayerInfo {
-  id: number;
-  player: string;
-  score: string;
-  currentPosition: number;
-}
-
-interface TxTrace {
-  startSessionTxHash?: string;
-  delegateBoardTxHash?: string;
-  endSessionTxHash?: string;
-  rewardTxHash?: string;
-  rewardTxSolscanUrl?: string;
-  rewardError?: string;
-}
-
-interface CompletedGameSnapshot {
-  source?: string;
-  currentGameId: number;
-  boardPDA?: string;
-  playersCount?: number;
-  isActive?: boolean;
-  gameEndTimestamp?: number;
-  secondsRemaining?: number;
-  players?: PlayerInfo[];
-  board?: number[][];
-  boardLegend?: { 0: string; "1-4": string; 5: string };
-  completedAtIso: string;
-  txTrace: TxTrace;
-}
-
-interface GameStatus {
-  ok: boolean;
-  source?: string;
-  currentGameId: number | null;
-  boardPDA?: string;
-  playersCount?: number;
-  isActive?: boolean;
-  gameEndTimestamp?: number;
-  secondsRemaining?: number;
-  players?: PlayerInfo[];
-  board?: number[][];
-  message?: string;
-  lastCompletedGame?: CompletedGameSnapshot | null;
-}
-
-function getBoardPDA(gameId: number): PublicKey {
-  const gameIdBuf = Buffer.alloc(8);
-  gameIdBuf.writeBigUInt64LE(BigInt(gameId));
-  const [pda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("board"), TREASURY_PUBKEY.toBuffer(), gameIdBuf],
-    PROGRAM_ID
-  );
-  return pda;
-}
-
-function buildRegisterPlayerIx(
-  payer: PublicKey,
-  boardPDA: PublicKey,
-  gameId: number
-): TransactionInstruction {
-  const data = Buffer.alloc(8 + 8);
-  Buffer.from(REGISTER_PLAYER_DISCRIMINATOR).copy(data, 0);
-  data.writeBigUInt64LE(BigInt(gameId), 8);
-
-  return new TransactionInstruction({
-    keys: [
-      { pubkey: payer, isSigner: true, isWritable: true },
-      { pubkey: boardPDA, isSigner: false, isWritable: true },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      { pubkey: TREASURY_PUBKEY, isSigner: false, isWritable: true },
-    ],
-    programId: PROGRAM_ID,
-    data,
-  });
-}
-
-function buildMakeMoveIx(
-  payer: PublicKey,
-  boardPDA: PublicKey,
-  gameId: number,
-  playerId: number,
-  movePosition: number
-): TransactionInstruction {
-  const data = Buffer.alloc(8 + 8 + 1 + 2);
-  Buffer.from(MAKE_MOVE_DISCRIMINATOR).copy(data, 0);
-  data.writeBigUInt64LE(BigInt(gameId), 8);
-  data.writeUInt8(playerId, 16);
-  data.writeInt16LE(movePosition, 17);
-
-  return new TransactionInstruction({
-    keys: [
-      { pubkey: TREASURY_PUBKEY, isSigner: false, isWritable: false },
-      { pubkey: payer, isSigner: true, isWritable: false },
-      { pubkey: boardPDA, isSigner: false, isWritable: true },
-    ],
-    programId: PROGRAM_ID,
-    data,
-  });
-}
-
-function moveLabel(m: number): string {
-  if (m === -12) return "UP";
-  if (m === 12) return "DOWN";
-  if (m === -1) return "LEFT";
-  if (m === 1) return "RIGHT";
-  return String(m);
-}
-
-function formatTime(secs: number): string {
-  const m = Math.floor(secs / 60);
-  const s = secs % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
-
-function getWinningPlayerId(players: PlayerInfo[]): number | null {
-  if (!players.length) return null;
-  const topScore = Math.max(...players.map((p) => Number(p.score)));
-  const leaders = players.filter((p) => Number(p.score) === topScore);
-  return leaders.length === 1 ? leaders[0].id : null;
-}
+import {
+  BOARD_SIZE,
+  COLS,
+  COIN_X_POSITIONS,
+  EMPTY,
+  ER_ENDPOINT,
+  GAME_ID,
+  KING_MARK,
+  MEMO_PROGRAM_ID,
+  PLAYER_COLORS,
+  PLAYER_LABELS,
+  REGISTRATION_FEE_LAMPORTS,
+  RELAYER_URL,
+} from "./game/constants";
+import { buildMakeMoveIx, buildRegisterPlayerIx } from "./game/instructions";
+import { getBoardPDA } from "./game/pda";
+import { getWinningPlayerId } from "./game/winner";
+import { CompletedGameSnapshot, GameStatus, PlayerInfo } from "./game/types";
+import { formatTime, moveLabel } from "./utils/format";
 
 const App: React.FC = () => {
   const { publicKey, sendTransaction } = useWallet();
@@ -855,7 +720,11 @@ const App: React.FC = () => {
               onClick={registerForGame}
               disabled={registerPending || !sessionFunded}
             >
-              {!sessionFunded ? "Funding session…" : registerPending ? "Registering…" : `Register (${REGISTRATION_FEE_LAMPORTS / 1e6} SOL)`}
+              {!sessionFunded
+                ? "Funding session…"
+                : registerPending
+                  ? "Registering…"
+                  : `Register (${REGISTRATION_FEE_LAMPORTS / LAMPORTS_PER_SOL} SOL)`}
             </button>
           )}
         </div>

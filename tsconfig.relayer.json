@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["relayer.ts", "relayer/**/*.ts", "target/types/**/*.ts"],
+  "exclude": ["app/**", "programs/**", "node_modules/**"]
+}
+
