@@ -16,6 +16,39 @@ const PORT = Number(process.env.PORT || 8787);
 
 // Must match programs/king_tiles/src/lib.rs TREASURY constant
 const PROGRAM_TREASURY_PUBKEY = "86uKSrcwj3j6gaSkK5Ggvt4ni5rokpBhrk2X2jUjDUoA";
+const SOLSCAN_DEVNET_TX_BASE = "https://solscan.io/tx";
+
+type TxTrace = {
+  startSessionTxHash?: string;
+  delegateBoardTxHash?: string;
+  endSessionTxHash?: string;
+  rewardTxHash?: string;
+  rewardTxSolscanUrl?: string;
+  rewardError?: string;
+};
+
+type BoardStatusPayload = {
+  source: string;
+  currentGameId: number;
+  boardPDA: string;
+  playersCount: number;
+  isActive: boolean;
+  gameEndTimestamp: number;
+  secondsRemaining: number;
+  players: Array<{
+    id: number;
+    player: string;
+    score: string;
+    currentPosition: number;
+  }>;
+  board: number[][];
+  boardLegend: { 0: string; "1-4": string; 5: string };
+};
+
+type CompletedGameSnapshot = BoardStatusPayload & {
+  completedAtIso: string;
+  txTrace: TxTrace;
+};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -49,6 +82,41 @@ function getBoardPDA(
     ],
     programId
   );
+}
+
+function toBoardGrid(flat: Uint8Array): number[][] {
+  const COLS = 12;
+  const flatBoard: number[] = Array.from(flat);
+  return Array.from({ length: COLS }, (_, row) =>
+    flatBoard.slice(row * COLS, row * COLS + COLS)
+  );
+}
+
+function toBoardStatusPayload(
+  board: any,
+  gameId: number,
+  boardPDA: PublicKey,
+  source: string
+): BoardStatusPayload {
+  const now = Math.floor(Date.now() / 1000);
+  const gameEndTimestamp = Number(board.gameEndTimestamp);
+  return {
+    source,
+    currentGameId: gameId,
+    boardPDA: boardPDA.toBase58(),
+    playersCount: Number(board.playersCount),
+    isActive: !!board.isActive,
+    gameEndTimestamp,
+    secondsRemaining: board.isActive ? Math.max(0, gameEndTimestamp - now) : 0,
+    players: board.players.map((p: any) => ({
+      id: Number(p.id),
+      player: p.player.toBase58(),
+      score: p.score.toString(),
+      currentPosition: Number(p.currentPosition),
+    })),
+    board: toBoardGrid(board.board),
+    boardLegend: { 0: "empty", "1-4": "player id", 5: "king" },
+  };
 }
 
 // ─── Bootstrap ──────────────────────────────────────────────────────────────
@@ -110,6 +178,7 @@ async function bootstrap(): Promise<void> {
   // Oracle queue for VRF on the Ephemeral Rollup
   const EPHEMERAL_ORACLE_QUEUE = new PublicKey("5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc");
   const KING_MOVE_INTERVAL_MS = 5_000;
+  const KING_FALLBACK_DELAY_MS = 3_000;
   const GAME_DURATION_MS = 60_000;
 
   // ─── Relayer state ─────────────────────────────────────────────────────────
@@ -117,6 +186,10 @@ async function bootstrap(): Promise<void> {
   let gameTimer: NodeJS.Timeout | null = null;
   let kingMoveInterval: NodeJS.Timeout | null = null;
   let scoreInterval: NodeJS.Timeout | null = null;
+  let fallbackTimer: NodeJS.Timeout | null = null;
+  let lastKnownKingPos: number | null = null;
+  let currentGameTxTrace: TxTrace = {};
+  let lastCompletedGame: CompletedGameSnapshot | null = null;
 
   // ─── Update player score on the ER (called every 1s during game) ──────────
   async function updatePlayerScore(gameId: number, boardPDA: PublicKey): Promise<void> {
@@ -210,14 +283,28 @@ async function bootstrap(): Promise<void> {
       );
       console.log(`  ER tx confirmed  → ER signature  : ${erTxHash}`);
       console.log(`  ER explorer      : https://explorer.magicblock.app/tx/${erTxHash}`);
-
-      currentGameId = null;
-      gameTimer = null;
+      const endPhaseTxTrace: TxTrace = {
+        ...currentGameTxTrace,
+        endSessionTxHash: erTxHash,
+      };
+      currentGameTxTrace = endPhaseTxTrace;
 
       console.log(`  Waiting 5s for devnet commitment to propagate...`);
       await new Promise((r) => setTimeout(r, 5_000));
+      try {
+        const postEndBoard = await program.account.board.fetch(boardPDA);
+        lastCompletedGame = {
+          ...toBoardStatusPayload(postEndBoard, gameId, boardPDA, "devnet"),
+          completedAtIso: new Date().toISOString(),
+          txTrace: endPhaseTxTrace,
+        };
+      } catch (snapshotErr: any) {
+        console.warn("  [Snapshot] Unable to capture post-end board:", snapshotErr?.message ?? snapshotErr);
+      }
+      currentGameId = null;
+      gameTimer = null;
 
-      await distributeRewards(gameId, boardPDA);
+      await distributeRewards(gameId, boardPDA, endPhaseTxTrace);
     } catch (err: any) {
       console.error(`  Error ending game ${gameId}:`, err.message ?? err);
       stopAllIntervals();
@@ -226,7 +313,12 @@ async function bootstrap(): Promise<void> {
     }
   }
 
-  async function distributeRewards(gameId: number, boardPDA: PublicKey, attempt = 1): Promise<void> {
+  async function distributeRewards(
+    gameId: number,
+    boardPDA: PublicKey,
+    txTrace: TxTrace,
+    attempt = 1
+  ): Promise<void> {
     const MAX_ATTEMPTS = 3;
     const RETRY_DELAY_MS = 30_000;
     console.log(`  [Rewards] Distributing rewards on devnet for gameId: ${gameId} (attempt ${attempt}/${MAX_ATTEMPTS})`);
@@ -258,16 +350,40 @@ async function bootstrap(): Promise<void> {
         [treasuryKeypair],
         { skipPreflight: true, commitment: "confirmed" }
       );
+      const rewardTxSolscanUrl = `${SOLSCAN_DEVNET_TX_BASE}/${rewardTxHash}?cluster=devnet`;
       console.log(`  [Rewards] Devnet tx confirmed → txHash: ${rewardTxHash}`);
+      console.log(`  [Rewards] Solscan             → ${rewardTxSolscanUrl}`);
+      const finalizedBoard = await program.account.board.fetch(boardPDA);
+      const finalizedTxTrace: TxTrace = {
+        ...txTrace,
+        rewardTxHash,
+        rewardTxSolscanUrl,
+        rewardError: undefined,
+      };
+      currentGameTxTrace = finalizedTxTrace;
+      lastCompletedGame = {
+        ...toBoardStatusPayload(finalizedBoard, gameId, boardPDA, "devnet"),
+        completedAtIso: new Date().toISOString(),
+        txTrace: finalizedTxTrace,
+      };
       console.log(`\n========== Game ${gameId} completed successfully ==========\n`);
     } catch (err: any) {
       const msg = err.message ?? String(err);
       console.error(`  [Rewards] Attempt ${attempt} failed for gameId ${gameId}: ${msg}`);
       if (attempt < MAX_ATTEMPTS) {
         console.log(`  [Rewards] Retrying in ${RETRY_DELAY_MS / 1000}s...`);
-        setTimeout(() => distributeRewards(gameId, boardPDA, attempt + 1), RETRY_DELAY_MS);
+        setTimeout(() => distributeRewards(gameId, boardPDA, txTrace, attempt + 1), RETRY_DELAY_MS);
       } else {
         console.error(`  [Rewards] All ${MAX_ATTEMPTS} attempts exhausted for gameId ${gameId}. Manual intervention needed.`);
+        if (lastCompletedGame?.currentGameId === gameId) {
+          lastCompletedGame = {
+            ...lastCompletedGame,
+            txTrace: {
+              ...lastCompletedGame.txTrace,
+              rewardError: msg,
+            },
+          };
+        }
       }
     }
   }
@@ -307,6 +423,10 @@ async function bootstrap(): Promise<void> {
         [treasuryKeypair],
         { skipPreflight: true, commitment: "confirmed" }
       );
+      currentGameTxTrace = {
+        ...currentGameTxTrace,
+        delegateBoardTxHash: delegateTxHash,
+      };
       console.log(`  Board delegated to ER → txHash: ${delegateTxHash}`);
 
       // Step 2: Start king move VRF interval (every 5s) and 60s game timer
@@ -399,6 +519,9 @@ async function bootstrap(): Promise<void> {
       console.log(`  Board initialized on devnet → txHash: ${txHash}`);
 
       currentGameId = gameId;
+      currentGameTxTrace = {
+        startSessionTxHash: txHash,
+      };
 
       res.json({
         ok: true,
@@ -433,7 +556,12 @@ async function bootstrap(): Promise<void> {
   // GET /game-status — inspect current board state (tries ER first, falls back to devnet)
   app.get("/game-status", async (_req: Request, res: Response) => {
     if (currentGameId === null) {
-      res.json({ ok: true, message: "No active game", currentGameId: null });
+      res.json({
+        ok: true,
+        message: "No active game",
+        currentGameId: null,
+        lastCompletedGame,
+      });
       return;
     }
     try {
@@ -481,34 +609,11 @@ async function bootstrap(): Promise<void> {
         }
       }
 
-      // Format flat 144-cell array as a 12×12 grid for readability
-      // 0 = empty, 1 = player mark, 2 = king mark
-      const COLS = 12;
-      const flatBoard: number[] = Array.from(board.board);
-      const boardGrid = Array.from({ length: COLS }, (_, row) =>
-        flatBoard.slice(row * COLS, row * COLS + COLS)
-      );
-
-      const now = Math.floor(Date.now() / 1000);
-      const gameEndTimestamp = Number(board.gameEndTimestamp);
-
+      const payload = toBoardStatusPayload(board, currentGameId, boardPDA, source);
       res.json({
         ok: true,
-        source,
-        currentGameId,
-        boardPDA: boardPDA.toBase58(),
-        playersCount: board.playersCount,
-        isActive: board.isActive,
-        gameEndTimestamp,
-        secondsRemaining: board.isActive ? Math.max(0, gameEndTimestamp - now) : 0,
-        players: board.players.map((p: any) => ({
-          id: p.id,
-          player: p.player.toBase58(),
-          score: p.score.toString(),
-          currentPosition: p.currentPosition,
-        })),
-        board: boardGrid,
-        boardLegend: { 0: "empty", "1-4": "player id", 5: "king" },
+        ...payload,
+        lastCompletedGame,
       });
     } catch (error: any) {
       res.status(500).json({ ok: false, error: error.message ?? "Unknown error" });

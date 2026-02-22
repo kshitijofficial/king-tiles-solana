@@ -294,6 +294,26 @@ pub mod king_tiles {
         }
         Ok(())
     }
+
+    pub fn close_board(ctx: Context<CloseBoard>, game_id: u64) -> Result<()> {
+        msg!("Closing board for game_id: {}", game_id);
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+#[instruction(game_id: u64)]
+pub struct CloseBoard<'info> {
+    #[account(
+        mut,
+        close = treasury, // rent goes back to treasury
+        seeds = [b"board", treasury.key().as_ref(), &game_id.to_le_bytes()],
+        bump
+    )]
+    pub board_account: Account<'info, Board>,
+
+    #[account(mut)]
+    pub treasury: Signer<'info>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace)]

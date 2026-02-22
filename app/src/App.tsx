@@ -31,6 +31,7 @@ const BOARD_SIZE = 144;
 const COLS = 12;
 const RELAYER_URL = "http://localhost:8787";
 const ER_ENDPOINT = "https://devnet.magicblock.app/";
+const MEMO_PROGRAM_ID = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
 const EMPTY = 0;
 const KING_MARK = 5;
@@ -53,6 +54,30 @@ interface PlayerInfo {
   currentPosition: number;
 }
 
+interface TxTrace {
+  startSessionTxHash?: string;
+  delegateBoardTxHash?: string;
+  endSessionTxHash?: string;
+  rewardTxHash?: string;
+  rewardTxSolscanUrl?: string;
+  rewardError?: string;
+}
+
+interface CompletedGameSnapshot {
+  source?: string;
+  currentGameId: number;
+  boardPDA?: string;
+  playersCount?: number;
+  isActive?: boolean;
+  gameEndTimestamp?: number;
+  secondsRemaining?: number;
+  players?: PlayerInfo[];
+  board?: number[][];
+  boardLegend?: { 0: string; "1-4": string; 5: string };
+  completedAtIso: string;
+  txTrace: TxTrace;
+}
+
 interface GameStatus {
   ok: boolean;
   source?: string;
@@ -65,6 +90,7 @@ interface GameStatus {
   players?: PlayerInfo[];
   board?: number[][];
   message?: string;
+  lastCompletedGame?: CompletedGameSnapshot | null;
 }
 
 function getBoardPDA(gameId: number): PublicKey {
@@ -136,6 +162,13 @@ function formatTime(secs: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+function getWinningPlayerId(players: PlayerInfo[]): number | null {
+  if (!players.length) return null;
+  const topScore = Math.max(...players.map((p) => Number(p.score)));
+  const leaders = players.filter((p) => Number(p.score) === topScore);
+  return leaders.length === 1 ? leaders[0].id : null;
+}
+
 const App: React.FC = () => {
   const { publicKey, sendTransaction } = useWallet();
   const { connection: devnetConnection } = useConnection();
@@ -154,7 +187,6 @@ const App: React.FC = () => {
   const [logs, setLogs] = useState<string[]>([]);
   const [countdown, setCountdown] = useState<number>(0);
   const [error, setError] = useState<string | null>(null);
-  const [movePending, setMovePending] = useState(false);
   const [registerPending, setRegisterPending] = useState(false);
   const [showKingNotif, setShowKingNotif] = useState(false);
   const [kingNotifKey, setKingNotifKey] = useState(0);
@@ -170,22 +202,37 @@ const App: React.FC = () => {
   const prevPlayerScoresRef = useRef<Map<number, number> | null>(null);
   const kingStreakRef = useRef<Map<number, number>>(new Map());
   const kingTileIndexRef = useRef<number | null>(null);
+
+  // Optimistic move system: cached blockhash + local board overlay
+  const cachedBlockhashRef = useRef<{ blockhash: string; fetchedAt: number } | null>(null);
+  const optimisticBoardRef = useRef<number[] | null>(null);
+  const [optimisticBoard, setOptimisticBoard] = useState<number[] | null>(null);
+  const moveDebounceRef = useRef<number>(0);
+  const lastOptimisticMoveRef = useRef<number>(0);
+  const OPTIMISTIC_HOLD_MS = 2000;
+
   const { playMoveSound } = useMoveSound(0.1);
   const { playKingPower } = useKingPowerSound(0.15);
   const { playEmergencyTick } = useEmergencyCountdownSound(0.17);
 
+  const displayGame = useMemo<CompletedGameSnapshot | GameStatus | null>(() => {
+    if (!gameStatus) return null;
+    if (gameStatus.currentGameId !== null) return gameStatus;
+    return gameStatus.lastCompletedGame ?? null;
+  }, [gameStatus]);
+
   const myPlayerId = useMemo(() => {
-    if (!sessionKeypair || !gameStatus?.players) return null;
+    if (!sessionKeypair || !displayGame?.players) return null;
     const addr = sessionKeypair.publicKey.toBase58();
-    const found = gameStatus.players.find((p) => p.player === addr);
+    const found = displayGame.players.find((p) => p.player === addr);
     return found ? found.id : null;
-  }, [sessionKeypair, gameStatus?.players]);
+  }, [sessionKeypair, displayGame?.players]);
 
   const myScore = useMemo(() => {
-    if (!myPlayerId || !gameStatus?.players) return 0;
-    const p = gameStatus.players.find((x) => x.id === myPlayerId);
+    if (!myPlayerId || !displayGame?.players) return 0;
+    const p = displayGame.players.find((x) => x.id === myPlayerId);
     return p ? Number(p.score) : 0;
-  }, [myPlayerId, gameStatus?.players]);
+  }, [myPlayerId, displayGame?.players]);
 
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [`${new Date().toLocaleTimeString()} ${msg}`, ...prev].slice(0, 30));
@@ -245,13 +292,52 @@ const App: React.FC = () => {
     return () => { cancelled = true; };
   }, [sessionKeypair, devnetConnection, publicKey, sendTransaction, addLog]);
 
+  // Background ER blockhash cache — refreshes every 20s so moves never block on it
+  useEffect(() => {
+    let active = true;
+    const refresh = async () => {
+      try {
+        const { blockhash } = await erConnection.getLatestBlockhash();
+        if (active) cachedBlockhashRef.current = { blockhash, fetchedAt: Date.now() };
+      } catch { /* silent — will retry */ }
+    };
+    refresh();
+    const id = setInterval(refresh, 20_000);
+    return () => { active = false; clearInterval(id); };
+  }, [erConnection]);
+
+  // Reconcile optimistic board with server state.
+  // Keep optimistic state briefly to avoid "step back" flicker from stale poll responses.
+  useEffect(() => {
+    if (!gameStatus?.board || !optimisticBoardRef.current) return;
+
+    const serverBoard = gameStatus.board.flat();
+    const optimistic = optimisticBoardRef.current;
+    const holdExpired = Date.now() - lastOptimisticMoveRef.current > OPTIMISTIC_HOLD_MS;
+
+    if (!myPlayerId) {
+      optimisticBoardRef.current = null;
+      setOptimisticBoard(null);
+      return;
+    }
+
+    const serverPos = serverBoard.indexOf(myPlayerId);
+    const optimisticPos = optimistic.indexOf(myPlayerId);
+    const serverCaughtUp = serverPos >= 0 && serverPos === optimisticPos;
+
+    if (serverCaughtUp || holdExpired) {
+      optimisticBoardRef.current = null;
+      setOptimisticBoard(null);
+    }
+  }, [gameStatus?.board, myPlayerId]);
+
   // King position notification — pops fresh every second the player is on the king tile
   useEffect(() => {
-    if (!myPlayerId || !gameStatus?.isActive || !gameStatus?.playersCount) {
+    if (!myPlayerId || !displayGame?.isActive || !displayGame?.playersCount) {
       setShowKingNotif(false);
       return;
     }
-    const p = gameStatus.players?.find((x) => x.id === myPlayerId);
+    const p = displayGame.players?.find((x) => x.id === myPlayerId);
     const score = p ? Number(p.score) : 0;
     if (score > lastScoreRef.current) {
       lastScoreRef.current = score;
@@ -262,28 +348,35 @@ const App: React.FC = () => {
       return () => clearTimeout(t);
     }
     lastScoreRef.current = score;
-  }, [gameStatus?.players, gameStatus?.isActive, myPlayerId, gameStatus?.playersCount]);
+  }, [displayGame?.players, displayGame?.isActive, myPlayerId, displayGame?.playersCount]);
 
-  // Detect active → inactive transition to trigger Game Over modal + transfer animation
+  // Detect active → inactive transition to trigger Game Over modal.
   useEffect(() => {
-    const isActive = gameStatus?.isActive;
+    const isActive = displayGame?.isActive;
     if (isActive === undefined || isActive === null) return;
 
     if (prevIsActiveRef.current === true && isActive === false) {
       setShowKingNotif(false);
-      setEndedGamePlayers(gameStatus?.players ?? []);
-      setEndedGamePlayerCount(gameStatus?.playersCount ?? 0);
+      setEndedGamePlayers(displayGame?.players ?? []);
+      setEndedGamePlayerCount(displayGame?.playersCount ?? 0);
       setShowGameOverModal(true);
+    }
+    prevIsActiveRef.current = isActive;
+  }, [displayGame]);
+
+  const closeGameOverModal = useCallback(() => {
+    setShowGameOverModal(false);
+    const rewardTxSent = !!gameStatus?.lastCompletedGame?.txTrace?.rewardTxHash;
+    if (rewardTxSent) {
       setShowTransferAnim(true);
       setTimeout(() => setShowTransferAnim(false), 4500);
     }
-    prevIsActiveRef.current = isActive;
-  }, [gameStatus]);
+  }, [gameStatus?.lastCompletedGame?.txTrace?.rewardTxHash]);
 
   // Move SFX: play a short sound each time any player position changes.
   useEffect(() => {
-    const players = gameStatus?.players?.slice(0, gameStatus?.playersCount ?? 0) ?? [];
-    if (!players.length || !gameStatus?.isActive) {
+    const players = displayGame?.players?.slice(0, displayGame?.playersCount ?? 0) ?? [];
+    if (!players.length || !displayGame?.isActive) {
       prevPlayerPositionsRef.current = null;
       return;
     }
@@ -312,12 +405,12 @@ const App: React.FC = () => {
     }
 
     prevPlayerPositionsRef.current = nextMap;
-  }, [gameStatus?.players, gameStatus?.playersCount, gameStatus?.isActive, playMoveSound]);
+  }, [displayGame?.players, displayGame?.playersCount, displayGame?.isActive, playMoveSound]);
 
   // King scoring SFX: rising tone each second a player keeps scoring on king.
   useEffect(() => {
-    const players = gameStatus?.players?.slice(0, gameStatus?.playersCount ?? 0) ?? [];
-    if (!players.length || !gameStatus?.isActive) {
+    const players = displayGame?.players?.slice(0, displayGame?.playersCount ?? 0) ?? [];
+    if (!players.length || !displayGame?.isActive) {
       prevPlayerScoresRef.current = null;
       kingStreakRef.current = new Map();
       return;
@@ -353,7 +446,7 @@ const App: React.FC = () => {
 
     kingStreakRef.current = newStreaks;
     prevPlayerScoresRef.current = nextScores;
-  }, [gameStatus?.players, gameStatus?.playersCount, gameStatus?.isActive, playKingPower]);
+  }, [displayGame?.players, displayGame?.playersCount, displayGame?.isActive, playKingPower]);
 
   const refetchGameStatus = useCallback(async () => {
     try {
@@ -464,39 +557,91 @@ const App: React.FC = () => {
   }, [sessionKeypair, sessionFunded, boardPDA, gameId, registerPending, gameStatus, myPlayerId, devnetConnection, addLog]);
 
   // Sign moves with the session keypair and send directly to the ER — no wallet popup.
+  // Uses optimistic local board update + fire-and-forget tx for instant feel.
   const makeMove = useCallback(
-    async (movePosition: number) => {
-      if (!sessionKeypair || !myPlayerId || movePending) return;
+    (movePosition: number) => {
+      if (!sessionKeypair || !myPlayerId) return;
       if (!gameStatus?.isActive) return;
 
-      setMovePending(true);
-      try {
-        const ix = buildMakeMoveIx(
-          sessionKeypair.publicKey,
-          boardPDA,
-          gameId,
-          myPlayerId,
-          movePosition
-        );
-        const tx = new Transaction().add(ix);
-        const { blockhash } = await erConnection.getLatestBlockhash();
-        tx.recentBlockhash = blockhash;
-        tx.feePayer = sessionKeypair.publicKey;
-        tx.sign(sessionKeypair);
-        const sig = await erConnection.sendRawTransaction(tx.serialize(), {
-          skipPreflight: true,
-        });
+      // Debounce: ignore rapid-fire presses within 120ms
+      const now = Date.now();
+      if (now - moveDebounceRef.current < 120) return;
+      moveDebounceRef.current = now;
 
-        addLog(`Moved ${moveLabel(movePosition)} (${sig.slice(0, 8)}...)`);
-        setTimeout(refetchGameStatus, 1200);
-        setTimeout(refetchGameStatus, 2500);
-      } catch (e: any) {
-        const msg = e?.message?.slice(0, 80) || "Unknown error";
-        addLog(`Move failed: ${msg}`);
+      // --- Optimistic local board update (instant) ---
+      const base = optimisticBoardRef.current
+        ?? (gameStatus.board ? gameStatus.board.flat() : null);
+      if (base) {
+        lastOptimisticMoveRef.current = now;
+        const board = [...base];
+        const currentPos = board.indexOf(myPlayerId);
+        if (currentPos >= 0) {
+          const raw = currentPos + movePosition;
+          const newPos = ((raw % BOARD_SIZE) + BOARD_SIZE) % BOARD_SIZE;
+          const target = board[newPos];
+
+          if (target === EMPTY || target === KING_MARK) {
+            board[currentPos] = EMPTY;
+            board[newPos] = myPlayerId;
+          } else if (target >= 1 && target <= 4 && target !== myPlayerId) {
+            const pushPos = ((newPos + movePosition + movePosition) % BOARD_SIZE + BOARD_SIZE) % BOARD_SIZE;
+            board[pushPos] = target;
+            board[currentPos] = EMPTY;
+            board[newPos] = myPlayerId;
+          }
+
+          optimisticBoardRef.current = board;
+          setOptimisticBoard(board);
+        }
       }
-      setMovePending(false);
+
+      // --- Fire-and-forget: build tx + send without awaiting ---
+      (async () => {
+        try {
+          const ix = buildMakeMoveIx(
+            sessionKeypair.publicKey,
+            boardPDA,
+            gameId,
+            myPlayerId,
+            movePosition
+          );
+          // Add a tiny memo payload so each move tx stays unique even with cached blockhash.
+          const memoIx = new TransactionInstruction({
+            programId: MEMO_PROGRAM_ID,
+            keys: [],
+            data: Buffer.from(`move:${Date.now()}:${movePosition}`),
+          });
+          const tx = new Transaction().add(ix, memoIx);
+
+          // Use cached blockhash if fresh (<30s), else fetch a new one
+          let blockhash: string;
+          const cached = cachedBlockhashRef.current;
+          if (cached && Date.now() - cached.fetchedAt < 30_000) {
+            blockhash = cached.blockhash;
+          } else {
+            const fresh = await erConnection.getLatestBlockhash();
+            blockhash = fresh.blockhash;
+            cachedBlockhashRef.current = { blockhash, fetchedAt: Date.now() };
+          }
+
+          tx.recentBlockhash = blockhash;
+          tx.feePayer = sessionKeypair.publicKey;
+          tx.sign(sessionKeypair);
+          const sig = await erConnection.sendRawTransaction(tx.serialize(), {
+            skipPreflight: true,
+          });
+
+          addLog(`Moved ${moveLabel(movePosition)} (${sig.slice(0, 8)}...)`);
+        } catch (e: any) {
+          // On failure, drop optimistic overlay so UI snaps back to on-chain truth.
+          optimisticBoardRef.current = null;
+          setOptimisticBoard(null);
+          const msg = e?.message?.slice(0, 220) || "Unknown error";
+          addLog(`Move failed: ${msg}`);
+        }
+      })();
     },
-    [sessionKeypair, myPlayerId, movePending, gameStatus?.isActive, boardPDA, gameId, erConnection, addLog, refetchGameStatus]
+    [sessionKeypair, myPlayerId, gameStatus?.isActive, gameStatus?.board, boardPDA, gameId, erConnection, addLog]
   );
 
   // Keyboard controls
@@ -538,9 +683,10 @@ const App: React.FC = () => {
   }, [makeMove]);
 
   const flatBoard = useMemo(() => {
-    if (!gameStatus?.board) return new Array(BOARD_SIZE).fill(0);
-    return gameStatus.board.flat();
-  }, [gameStatus?.board]);
+    if (optimisticBoard) return optimisticBoard;
+    if (!displayGame?.board) return new Array(BOARD_SIZE).fill(0);
+    return displayGame.board.flat();
+  }, [displayGame?.board, optimisticBoard]);
 
   // Track king tile index even when a player occupies it (backend may overwrite the tile value).
   const kingTileIndexFromBoard = useMemo(() => {
@@ -556,10 +702,12 @@ const App: React.FC = () => {
 
   const kingTileIndex = kingTileIndexFromBoard ?? kingTileIndexRef.current;
 
-  const statusText = gameStatus?.isActive
+  const statusText = displayGame?.isActive
     ? "ACTIVE"
     : gameStatus?.currentGameId !== null
-    ? `Waiting (${gameStatus?.playersCount ?? 0}/2 players)`
+    ? `Waiting (${displayGame?.playersCount ?? 0}/2 players)`
+    : displayGame
+    ? `Completed (Game ${displayGame.currentGameId})`
     : "No game";
 
   return (
@@ -606,7 +754,7 @@ const App: React.FC = () => {
             </div>
           ))}
           <div className="transfer-message">
-            💸 Transferring winnings to your wallet…
+            💸 Payout sent! Money flying to player wallets…
           </div>
         </div>
       )}
@@ -617,12 +765,16 @@ const App: React.FC = () => {
         const sorted = [...players].sort(
           (a, b) => Number(b.score) - Number(a.score)
         );
-        const winner = sorted[0];
-        const isMyWin = winner && myPlayerId === winner.id;
+        const winnerId = getWinningPlayerId(sorted);
+        const winner = winnerId
+          ? sorted.find((p) => p.id === winnerId) ?? null
+          : null;
+        const isMyWin = winnerId != null && myPlayerId === winnerId;
+        const payoutTxSent = !!gameStatus?.lastCompletedGame?.txTrace?.rewardTxHash;
         return (
           <div
             className="game-over-overlay"
-            onClick={() => setShowGameOverModal(false)}
+            onClick={closeGameOverModal}
           >
             <div
               className="game-over-modal"
@@ -641,6 +793,17 @@ const App: React.FC = () => {
                     : `👑 ${PLAYER_LABELS[winner.id - 1]} Wins!`}
                 </div>
               )}
+              {!winner && (
+                <div className="winner-announcement">
+                  🤝 Draw game! No single winner.
+                </div>
+              )}
+              <div className="status-row" style={{ marginBottom: 8 }}>
+                <span className="label">Payout:</span>
+                <span className="value">
+                  {payoutTxSent ? "Sent on-chain ✅" : "Pending/processing..."}
+                </span>
+              </div>
               <div className="final-scores-modal">
                 {sorted.map((p, i) => (
                   <div
@@ -659,7 +822,7 @@ const App: React.FC = () => {
               </div>
               <button
                 className="btn-dismiss"
-                onClick={() => setShowGameOverModal(false)}
+                onClick={closeGameOverModal}
               >
                 Close
               </button>
@@ -712,9 +875,9 @@ const App: React.FC = () => {
             </div>
             <div className="status-row">
               <span className="label">Source:</span>
-              <span className="value">{gameStatus?.source ?? "N/A"}</span>
+              <span className="value">{displayGame?.source ?? "N/A"}</span>
             </div>
-            {gameStatus?.isActive && (
+            {displayGame?.isActive && (
               <div className="status-row">
                 <span className="label">Time Left:</span>
                 <span
@@ -726,10 +889,58 @@ const App: React.FC = () => {
             )}
           </div>
 
+          {gameStatus?.lastCompletedGame && (
+            <div className="panel-section">
+              <h3>Last Settlement</h3>
+              <div className="status-row">
+                <span className="label">Game ID:</span>
+                <span className="value">{gameStatus.lastCompletedGame.currentGameId}</span>
+              </div>
+              {gameStatus.lastCompletedGame.txTrace.rewardTxSolscanUrl ? (
+                <div className="status-row">
+                  <span className="label">Payout Tx:</span>
+                  <a
+                    className="value mono"
+                    href={gameStatus.lastCompletedGame.txTrace.rewardTxSolscanUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Solscan link
+                  </a>
+                </div>
+              ) : (
+                <div className="status-row">
+                  <span className="label">Payout Tx:</span>
+                  <span className="value">
+                    {gameStatus.lastCompletedGame.txTrace.rewardError
+                      ? "Failed (see relayer logs)"
+                      : "Pending confirmation"}
+                  </span>
+                </div>
+              )}
+              {gameStatus.lastCompletedGame.txTrace.startSessionTxHash && (
+                <div className="status-row">
+                  <span className="label">Start Tx:</span>
+                  <span className="value mono">
+                    {gameStatus.lastCompletedGame.txTrace.startSessionTxHash.slice(0, 10)}...
+                  </span>
+                </div>
+              )}
+              {gameStatus.lastCompletedGame.txTrace.delegateBoardTxHash && (
+                <div className="status-row">
+                  <span className="label">Delegate Tx:</span>
+                  <span className="value mono">
+                    {gameStatus.lastCompletedGame.txTrace.delegateBoardTxHash.slice(0, 10)}...
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
           <div className="panel-section">
             <h3>Players</h3>
-            {gameStatus?.players
-              ?.slice(0, gameStatus?.playersCount ?? 0)
+            {displayGame?.players
+              ?.slice(0, displayGame?.playersCount ?? 0)
               ?.map((p, i) => (
               <div
                 key={i}
@@ -821,7 +1032,6 @@ const App: React.FC = () => {
                 <button
                   className="dpad-btn up"
                   onClick={() => makeMove(-12)}
-                  disabled={movePending}
                 >
                   ▲
                 </button>
@@ -829,21 +1039,18 @@ const App: React.FC = () => {
                   <button
                     className="dpad-btn left"
                     onClick={() => makeMove(-1)}
-                    disabled={movePending}
                   >
                     ◄
                   </button>
                   <button
                     className="dpad-btn down"
                     onClick={() => makeMove(12)}
-                    disabled={movePending}
                   >
                     ▼
                   </button>
                   <button
                     className="dpad-btn right"
                     onClick={() => makeMove(1)}
-                    disabled={movePending}
                   >
                     ►
                   </button>
@@ -872,15 +1079,15 @@ const App: React.FC = () => {
 
           {/* Fallback game-over panel visible after page refresh (no modal) */}
           {!showGameOverModal &&
-            gameStatus?.isActive === false &&
-            (gameStatus?.playersCount ?? 0) >= 2 &&
-            (gameStatus?.gameEndTimestamp ?? 0) > 0 &&
-            Math.floor(Date.now() / 1000) >= (gameStatus?.gameEndTimestamp ?? 0) && (
+            displayGame?.isActive === false &&
+            (displayGame?.playersCount ?? 0) >= 2 &&
+            (displayGame?.gameEndTimestamp ?? 0) > 0 &&
+            Math.floor(Date.now() / 1000) >= (displayGame?.gameEndTimestamp ?? 0) && (
               <div className="game-over">
                 <h2>🏆 Game Over!</h2>
                 <div className="final-scores">
-                  {gameStatus.players
-                    ?.slice(0, gameStatus?.playersCount ?? 0)
+                  {displayGame.players
+                    ?.slice(0, displayGame?.playersCount ?? 0)
                     ?.sort((a, b) => Number(b.score) - Number(a.score))
                     ?.map((p, i) => (
                       <div key={i} className="final-row">
