@@ -15,8 +15,6 @@ https://youtu.be/7BOSDaF4Ttw?si=KuipppdBiuSgdcNX
 - 🔁 **Relayer-powered Settlement** — Scores and rewards settle back to Solana devnet.
 - 🧠 **Hybrid Architecture** — Devnet registration + Rollup execution + Secure settlement.
 
-...
-
 - **Quick setup**: see `setup.md`
 - **System overview**: see `architecture.md`
 
