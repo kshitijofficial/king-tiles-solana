@@ -7,19 +7,6 @@ King Tiles is a small on-chain game that uses:
 - A **relayer** to orchestrate delegation, VRF ticks, scoring ticks, and end-of-game settlement
 - A **React UI** for players (with a deterministic “session key” per wallet)
 
-## High-level diagram
-
-```mermaid
-flowchart LR
-  UI[React UI\n(app/)] -->|poll /game-status| R[Relayer (Express)\n(relayer/)]
-  R -->|start_game_session, delegate_board,\ndistribute_rewards| L1[Solana devnet]
-  R -->|request_randomness,\nupdate_player_score,\nend_game_session| ER[Magicblock Ephemeral Rollup]
-  UI -->|register_player (devnet tx)\n(signed by session key)| L1
-  UI -->|make_move (ER tx)\n(signed by session key)| ER
-  L1 -->|GameStartedEvent| R
-  ER -->|VRF callback\nmoves king tile| ER
-```
-
 ## Components
 
 ### On-chain program (`programs/king_tiles`)
