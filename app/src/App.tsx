@@ -11,6 +11,10 @@ import {
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
 import "./App.css";
+import { BackgroundMusic } from "./BackgroundMusic";
+import { useMoveSound } from "./useMoveSound";
+import { useKingPowerSound } from "./useKingPowerSound";
+import { useEmergencyCountdownSound } from "./useEmergencyCountdownSound";
 
 // Must match the program used by the relayer (from target/idl or KING_TILES_PROGRAM_ID)
 const PROGRAM_ID = new PublicKey(
@@ -159,8 +163,16 @@ const App: React.FC = () => {
   const [endedGamePlayers, setEndedGamePlayers] = useState<PlayerInfo[]>([]);
   const [endedGamePlayerCount, setEndedGamePlayerCount] = useState(0);
   const [sessionFunded, setSessionFunded] = useState(false);
+  const [infoTab, setInfoTab] = useState<"rules" | "rewards">("rules");
   const lastScoreRef = useRef<number>(0);
   const prevIsActiveRef = useRef<boolean | undefined>(undefined);
+  const prevPlayerPositionsRef = useRef<Map<number, number> | null>(null);
+  const prevPlayerScoresRef = useRef<Map<number, number> | null>(null);
+  const kingStreakRef = useRef<Map<number, number>>(new Map());
+  const kingTileIndexRef = useRef<number | null>(null);
+  const { playMoveSound } = useMoveSound(0.1);
+  const { playKingPower } = useKingPowerSound(0.15);
+  const { playEmergencyTick } = useEmergencyCountdownSound(0.17);
 
   const myPlayerId = useMemo(() => {
     if (!sessionKeypair || !gameStatus?.players) return null;
@@ -268,6 +280,81 @@ const App: React.FC = () => {
     prevIsActiveRef.current = isActive;
   }, [gameStatus]);
 
+  // Move SFX: play a short sound each time any player position changes.
+  useEffect(() => {
+    const players = gameStatus?.players?.slice(0, gameStatus?.playersCount ?? 0) ?? [];
+    if (!players.length || !gameStatus?.isActive) {
+      prevPlayerPositionsRef.current = null;
+      return;
+    }
+
+    const nextMap = new Map<number, number>();
+    for (const p of players) nextMap.set(p.id, p.currentPosition);
+
+    const prevMap = prevPlayerPositionsRef.current;
+    if (!prevMap) {
+      prevPlayerPositionsRef.current = nextMap;
+      return;
+    }
+
+    let movedCount = 0;
+    for (const p of players) {
+      const prevPos = prevMap.get(p.id);
+      if (prevPos !== undefined && prevPos !== p.currentPosition) {
+        movedCount += 1;
+      }
+    }
+
+    // Polling can batch updates, so play up to 3 quick blips.
+    const blips = Math.min(movedCount, 3);
+    for (let i = 0; i < blips; i += 1) {
+      window.setTimeout(() => playMoveSound(), i * 90);
+    }
+
+    prevPlayerPositionsRef.current = nextMap;
+  }, [gameStatus?.players, gameStatus?.playersCount, gameStatus?.isActive, playMoveSound]);
+
+  // King scoring SFX: rising tone each second a player keeps scoring on king.
+  useEffect(() => {
+    const players = gameStatus?.players?.slice(0, gameStatus?.playersCount ?? 0) ?? [];
+    if (!players.length || !gameStatus?.isActive) {
+      prevPlayerScoresRef.current = null;
+      kingStreakRef.current = new Map();
+      return;
+    }
+
+    const nextScores = new Map<number, number>();
+    for (const p of players) nextScores.set(p.id, Number(p.score));
+
+    const prevScores = prevPlayerScoresRef.current;
+    if (!prevScores) {
+      prevPlayerScoresRef.current = nextScores;
+      return;
+    }
+
+    const newStreaks = new Map<number, number>();
+    for (const p of players) {
+      const prev = prevScores.get(p.id);
+      const curr = Number(p.score);
+      if (prev === undefined || curr <= prev) continue;
+
+      const delta = curr - prev;
+      const oldStreak = kingStreakRef.current.get(p.id) ?? 0;
+      const streak = oldStreak + delta;
+      newStreaks.set(p.id, streak);
+
+      // If polling batches updates, play up to 3 quick power pings.
+      const hits = Math.min(delta, 3);
+      for (let i = 0; i < hits; i += 1) {
+        const level = Math.min(streak - (hits - 1 - i), 10);
+        window.setTimeout(() => playKingPower(level), i * 120);
+      }
+    }
+
+    kingStreakRef.current = newStreaks;
+    prevPlayerScoresRef.current = nextScores;
+  }, [gameStatus?.players, gameStatus?.playersCount, gameStatus?.isActive, playKingPower]);
+
   const refetchGameStatus = useCallback(async () => {
     try {
       const res = await fetch(`${RELAYER_URL}/game-status`);
@@ -327,6 +414,14 @@ const App: React.FC = () => {
     const id = setInterval(tick, 250);
     return () => clearInterval(id);
   }, [gameStatus?.isActive, gameStatus?.gameEndTimestamp]);
+
+  // Emergency beep for the last 10 seconds (once per second)
+  useEffect(() => {
+    if (!gameStatus?.isActive) return;
+    if (countdown <= 10 && countdown > 0) {
+      playEmergencyTick();
+    }
+  }, [countdown, gameStatus?.isActive, playEmergencyTick]);
 
   const gameId = gameStatus?.currentGameId ?? GAME_ID;
   const boardPDA = useMemo(() => getBoardPDA(gameId), [gameId]);
@@ -447,6 +542,20 @@ const App: React.FC = () => {
     return gameStatus.board.flat();
   }, [gameStatus?.board]);
 
+  // Track king tile index even when a player occupies it (backend may overwrite the tile value).
+  const kingTileIndexFromBoard = useMemo(() => {
+    const idx = flatBoard.indexOf(KING_MARK);
+    return idx >= 0 ? idx : null;
+  }, [flatBoard]);
+
+  useEffect(() => {
+    if (kingTileIndexFromBoard != null) {
+      kingTileIndexRef.current = kingTileIndexFromBoard;
+    }
+  }, [kingTileIndexFromBoard]);
+
+  const kingTileIndex = kingTileIndexFromBoard ?? kingTileIndexRef.current;
+
   const statusText = gameStatus?.isActive
     ? "ACTIVE"
     : gameStatus?.currentGameId !== null
@@ -455,6 +564,7 @@ const App: React.FC = () => {
 
   return (
     <div className="app">
+      <BackgroundMusic />
       {/* ─── Header ─── */}
       <header className="header">
         <h1 className="title">
@@ -670,13 +780,26 @@ const App: React.FC = () => {
                 let cls = "cell";
                 let content: React.ReactNode = null;
 
-                if (cell === KING_MARK) {
-                  cls += " king";
-                  content = "👑";
-                } else if (cell >= 1 && cell <= 4) {
+                const isPlayer = cell >= 1 && cell <= 4;
+                const isKingTile = kingTileIndex != null && idx === kingTileIndex;
+
+                if (isPlayer) {
                   cls += ` player-cell p${cell}`;
                   if (myPlayerId === cell) cls += " me";
-                  content = PLAYER_LABELS[cell - 1];
+                  if (isKingTile) cls += " king-occupied";
+                  content = (
+                    <>
+                      {isKingTile && <span className="cell-king-corner">👑</span>}
+                      {PLAYER_LABELS[cell - 1]}
+                    </>
+                  );
+                } else if (cell === KING_MARK) {
+                  cls += " king";
+                  content = "👑";
+                } else if (isKingTile) {
+                  // If we know the king tile index, keep it visually marked even if the board value is empty.
+                  cls += " king";
+                  content = "👑";
                 }
 
                 return (
@@ -771,6 +894,63 @@ const App: React.FC = () => {
                 </div>
               </div>
             )}
+        </div>
+
+        {/* Right panel — Info (Rules / Rewards) */}
+        <div className="side-panel rules-panel">
+          <div className="panel-section info-panel">
+            <div className="info-tabs" role="tablist" aria-label="Game information">
+              <button
+                type="button"
+                className={`info-tab ${infoTab === "rules" ? "active" : ""}`}
+                onClick={() => setInfoTab("rules")}
+                role="tab"
+                aria-selected={infoTab === "rules"}
+              >
+                Rules
+              </button>
+              <button
+                type="button"
+                className={`info-tab ${infoTab === "rewards" ? "active" : ""}`}
+                onClick={() => setInfoTab("rewards")}
+                role="tab"
+                aria-selected={infoTab === "rewards"}
+              >
+                Rewards
+              </button>
+            </div>
+
+            <div className="info-content" role="tabpanel">
+              {infoTab === "rules" ? (
+                <ul className="rules-list">
+                  <li>
+                    Connect your wallet and <strong>register</strong> by paying 0.001 SOL to join the match.
+                  </li>
+                  <li>The game starts once 2 players join and runs for a fixed time.</li>
+                  <li>
+                    Move using <strong>WASD</strong> or <strong>Arrow Keys</strong>.
+                  </li>
+                  <li>
+                    Stand on the <span className="king-em">👑 King Tile</span> to earn +1 score per second.
+                  </li>
+                  <li>Collide with another player to push them back 2 steps.</li>
+                  <li>Beware — other players can push you back 2 steps too.</li>
+                </ul>
+              ) : (
+                <ul className="rules-list">
+                  <li>
+                    Each point earned <strong>rewards you with 0.000029 SOL</strong>.
+                  </li>
+                  <li>The longer you stay on the King Tile, the more SOL you earn.</li>
+                  <li>When time runs out, your total score is converted into SOL.</li>
+                  <li>
+                    There are no winners or losers — your earnings depend on how long you control the King Tile.
+                  </li>
+                  <li>All rewards are automatically transferred to your wallet.</li>
+                </ul>
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>
