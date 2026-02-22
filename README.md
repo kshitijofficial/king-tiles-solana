@@ -2,6 +2,21 @@
 
 Turnless mini-game on Solana + Magicblock: players register on **devnet**, gameplay runs on an **ephemeral rollup** (fast moves + VRF king movement), and rewards settle back to devnet via a relayer.
 
+## 🎥 Demo Video
+
+👉 **Watch King Tiles in action:**  
+[![Watch the demo](https://youtu.be/7BOSDaF4Ttw?si=KuipppdBiuSgdcNX)  
+
+### 🔥 Highlights
+
+- ⚡ **Turnless Gameplay** — No waiting for turns. Real-time moves on an ephemeral rollup.
+- 👑 **VRF-based King Movement** — Verifiable randomness powers king movement.
+- 🚀 **Fast Execution** — Gameplay runs on Magicblock ephemeral rollup for instant response.
+- 🔁 **Relayer-powered Settlement** — Scores and rewards settle back to Solana devnet.
+- 🧠 **Hybrid Architecture** — Devnet registration + Rollup execution + Secure settlement.
+
+...
+
 - **Quick setup**: see `setup.md`
 - **System overview**: see `architecture.md`
 
