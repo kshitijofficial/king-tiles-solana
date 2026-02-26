@@ -16,6 +16,7 @@ import { useKingPowerSound } from "./useKingPowerSound";
 import { useEmergencyCountdownSound } from "./useEmergencyCountdownSound";
 import {
   BOARD_SIZE,
+  BOMB_MARK,
   COLS,
   COIN_X_POSITIONS,
   EMPTY,
@@ -25,6 +26,7 @@ import {
   MEMO_PROGRAM_ID,
   PLAYER_COLORS,
   PLAYER_LABELS,
+  POWERUP_MARK,
   REGISTRATION_FEE_LAMPORTS,
   RELAYER_URL,
 } from "./game/constants";
@@ -33,6 +35,24 @@ import { getBoardPDA } from "./game/pda";
 import { getWinningPlayerId } from "./game/winner";
 import { CompletedGameSnapshot, GameStatus, PlayerInfo } from "./game/types";
 import { formatTime, moveLabel } from "./utils/format";
+
+// Returns the board cell indices the power beam travels through, starting from
+// fromPos stepping by direction until it hits a board edge (or a player).
+function getBeamCells(fromPos: number, direction: number, board: number[]): number[] {
+  const cells: number[] = [];
+  let pos = fromPos;
+  for (let step = 0; step < BOARD_SIZE; step++) {
+    pos += direction;
+    if (pos < 0 || pos >= BOARD_SIZE) break;
+    // Horizontal moves (±1) must stay on the same row
+    if (Math.abs(direction) === 1 && Math.floor(pos / COLS) !== Math.floor(fromPos / COLS)) break;
+    cells.push(pos);
+    // Beam stops at the first enemy player cell (it's the target)
+    const cell = board[pos];
+    if (cell >= 1 && cell <= 4 && cell !== board[fromPos]) break;
+  }
+  return cells;
+}
 
 const App: React.FC = () => {
   const { publicKey, sendTransaction } = useWallet();
@@ -61,10 +81,21 @@ const App: React.FC = () => {
   const [endedGamePlayerCount, setEndedGamePlayerCount] = useState(0);
   const [sessionFunded, setSessionFunded] = useState(false);
   const [infoTab, setInfoTab] = useState<"rules" | "rewards">("rules");
+  const [showPowerupAcquired, setShowPowerupAcquired] = useState(false);
+  const [powerupAcquiredKey, setPowerupAcquiredKey] = useState(0);
+  const [showBombAnim, setShowBombAnim] = useState(false);
+  const [bombAnimKey, setBombAnimKey] = useState(0);
+  const [powerBeam, setPowerBeam] = useState<number[] | null>(null);
+  const powerBeamTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const kingNotifTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const powerupNotifTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const lastScoreRef = useRef<number>(0);
   const prevIsActiveRef = useRef<boolean | undefined>(undefined);
   const prevPlayerPositionsRef = useRef<Map<number, number> | null>(null);
   const prevPlayerScoresRef = useRef<Map<number, number> | null>(null);
+  const prevPowerupScoresRef = useRef<Map<number, number> | null>(null);
+  const prevFlatBoardRef = useRef<number[] | null>(null);
   const kingStreakRef = useRef<Map<number, number>>(new Map());
   const kingTileIndexRef = useRef<number | null>(null);
 
@@ -97,6 +128,12 @@ const App: React.FC = () => {
     if (!myPlayerId || !displayGame?.players) return 0;
     const p = displayGame.players.find((x) => x.id === myPlayerId);
     return p ? Number(p.score) : 0;
+  }, [myPlayerId, displayGame?.players]);
+
+  const myPowerupScore = useMemo(() => {
+    if (!myPlayerId || !displayGame?.players) return 0;
+    const p = displayGame.players.find((x) => x.id === myPlayerId);
+    return p ? Number(p.powerupScore ?? 0) : 0;
   }, [myPlayerId, displayGame?.players]);
 
   const addLog = useCallback((msg: string) => {
@@ -199,6 +236,10 @@ const App: React.FC = () => {
   // King position notification — pops fresh every second the player is on the king tile
   useEffect(() => {
     if (!myPlayerId || !displayGame?.isActive || !displayGame?.playersCount) {
+      if (kingNotifTimerRef.current) {
+        clearTimeout(kingNotifTimerRef.current);
+        kingNotifTimerRef.current = null;
+      }
       setShowKingNotif(false);
       return;
     }
@@ -206,11 +247,19 @@ const App: React.FC = () => {
     const score = p ? Number(p.score) : 0;
     if (score > lastScoreRef.current) {
       lastScoreRef.current = score;
+      if (powerupNotifTimerRef.current) {
+        clearTimeout(powerupNotifTimerRef.current);
+        powerupNotifTimerRef.current = null;
+      }
+      setShowPowerupAcquired(false);
+      if (kingNotifTimerRef.current) clearTimeout(kingNotifTimerRef.current);
       // Increment key to force remount → animation replays each second
       setKingNotifKey((k) => k + 1);
       setShowKingNotif(true);
-      const t = setTimeout(() => setShowKingNotif(false), 1200);
-      return () => clearTimeout(t);
+      kingNotifTimerRef.current = setTimeout(() => {
+        setShowKingNotif(false);
+        kingNotifTimerRef.current = null;
+      }, 1200);
     }
     lastScoreRef.current = score;
   }, [displayGame?.players, displayGame?.isActive, myPlayerId, displayGame?.playersCount]);
@@ -221,7 +270,16 @@ const App: React.FC = () => {
     if (isActive === undefined || isActive === null) return;
 
     if (prevIsActiveRef.current === true && isActive === false) {
+      if (kingNotifTimerRef.current) {
+        clearTimeout(kingNotifTimerRef.current);
+        kingNotifTimerRef.current = null;
+      }
+      if (powerupNotifTimerRef.current) {
+        clearTimeout(powerupNotifTimerRef.current);
+        powerupNotifTimerRef.current = null;
+      }
       setShowKingNotif(false);
+      setShowPowerupAcquired(false);
       setEndedGamePlayers(displayGame?.players ?? []);
       setEndedGamePlayerCount(displayGame?.playersCount ?? 0);
       setShowGameOverModal(true);
@@ -232,11 +290,14 @@ const App: React.FC = () => {
   const closeGameOverModal = useCallback(() => {
     setShowGameOverModal(false);
     const rewardTxSent = !!gameStatus?.lastCompletedGame?.txTrace?.rewardTxHash;
-    if (rewardTxSent) {
+    const hasAnyPayout = endedGamePlayers
+      .slice(0, endedGamePlayerCount)
+      .some((p) => Number(p.score) > 0);
+    if (rewardTxSent && hasAnyPayout) {
       setShowTransferAnim(true);
       setTimeout(() => setShowTransferAnim(false), 4500);
     }
-  }, [gameStatus?.lastCompletedGame?.txTrace?.rewardTxHash]);
+  }, [gameStatus?.lastCompletedGame?.txTrace?.rewardTxHash, endedGamePlayers, endedGamePlayerCount]);
 
   // Move SFX: play a short sound each time any player position changes.
   useEffect(() => {
@@ -312,6 +373,72 @@ const App: React.FC = () => {
     kingStreakRef.current = newStreaks;
     prevPlayerScoresRef.current = nextScores;
   }, [displayGame?.players, displayGame?.playersCount, displayGame?.isActive, playKingPower]);
+
+  // Powerup acquired notification — fires when MY player's powerupScore goes from 0 → > 0
+  useEffect(() => {
+    const players = displayGame?.players?.slice(0, displayGame?.playersCount ?? 0) ?? [];
+    if (!players.length || !displayGame?.isActive || !myPlayerId) {
+      prevPowerupScoresRef.current = null;
+      if (powerupNotifTimerRef.current) {
+        clearTimeout(powerupNotifTimerRef.current);
+        powerupNotifTimerRef.current = null;
+      }
+      setShowPowerupAcquired(false);
+      return;
+    }
+
+    const nextMap = new Map<number, number>();
+    for (const p of players) nextMap.set(p.id, Number(p.powerupScore ?? 0));
+
+    const prevMap = prevPowerupScoresRef.current;
+    prevPowerupScoresRef.current = nextMap;
+    if (!prevMap) return;
+
+    const prev = prevMap.get(myPlayerId) ?? 0;
+    const curr = nextMap.get(myPlayerId) ?? 0;
+    if (prev === 0 && curr > 0) {
+      if (kingNotifTimerRef.current) {
+        clearTimeout(kingNotifTimerRef.current);
+        kingNotifTimerRef.current = null;
+      }
+      setShowKingNotif(false);
+      if (powerupNotifTimerRef.current) clearTimeout(powerupNotifTimerRef.current);
+      setPowerupAcquiredKey((k) => k + 1);
+      setShowPowerupAcquired(true);
+      powerupNotifTimerRef.current = setTimeout(() => {
+        setShowPowerupAcquired(false);
+        powerupNotifTimerRef.current = null;
+      }, 2500);
+    }
+  }, [displayGame?.players, displayGame?.playersCount, displayGame?.isActive, myPlayerId]);
+
+  // Bomb landing — fires when MY player moves onto a cell that was a bomb tile last poll
+  useEffect(() => {
+    const flat = displayGame?.board ? displayGame.board.flat() : null;
+    if (!flat || !myPlayerId || !displayGame?.isActive) {
+      prevFlatBoardRef.current = flat;
+      return;
+    }
+
+    const prev = prevFlatBoardRef.current;
+    prevFlatBoardRef.current = flat;
+    if (!prev) return;
+
+    const myNewPos = flat.indexOf(myPlayerId);
+    if (myNewPos >= 0 && prev[myNewPos] === BOMB_MARK) {
+      setBombAnimKey((k) => k + 1);
+      setShowBombAnim(true);
+      const t = setTimeout(() => setShowBombAnim(false), 1800);
+      return () => clearTimeout(t);
+    }
+  }, [displayGame?.board, displayGame?.isActive, myPlayerId]);
+
+  useEffect(() => {
+    return () => {
+      if (kingNotifTimerRef.current) clearTimeout(kingNotifTimerRef.current);
+      if (powerupNotifTimerRef.current) clearTimeout(powerupNotifTimerRef.current);
+    };
+  }, []);
 
   const refetchGameStatus = useCallback(async () => {
     try {
@@ -445,7 +572,22 @@ const App: React.FC = () => {
           const newPos = ((raw % BOARD_SIZE) + BOARD_SIZE) % BOARD_SIZE;
           const target = board[newPos];
 
-          if (target === EMPTY || target === KING_MARK) {
+          if (target === BOMB_MARK) {
+            // Match on-chain behavior immediately:
+            // hit bomb -> clear bomb tile -> warp to player's start slot (probe if occupied).
+            setBombAnimKey((k) => k + 1);
+            setShowBombAnim(true);
+            window.setTimeout(() => setShowBombAnim(false), 1800);
+            board[currentPos] = EMPTY;
+            board[newPos] = EMPTY;
+            let landing = Math.max(0, myPlayerId - 1);
+            for (let i = 0; i < BOARD_SIZE; i += 1) {
+              if (board[landing] === EMPTY) break;
+              landing = (landing + 1) % BOARD_SIZE;
+            }
+            board[landing] = myPlayerId;
+            addLog("💣 Bomb hit! Warped to start.");
+          } else if (target === EMPTY || target === KING_MARK || target === POWERUP_MARK) {
             board[currentPos] = EMPTY;
             board[newPos] = myPlayerId;
           } else if (target >= 1 && target <= 4 && target !== myPlayerId) {
@@ -509,43 +651,87 @@ const App: React.FC = () => {
     [sessionKeypair, myPlayerId, gameStatus?.isActive, gameStatus?.board, boardPDA, gameId, erConnection, addLog]
   );
 
-  // Keyboard controls
+  // Fire power in a direction via the relayer (treasury is required signer for use_power)
+  const usePower = useCallback(
+    (direction: number) => {
+      if (!myPlayerId || !gameStatus?.isActive) return;
+      if (myPowerupScore <= 0) {
+        addLog("No power charged. Step on ⚡ to acquire.");
+        return;
+      }
+
+      // ── Beam animation: light up the scanned cells immediately ──────────────
+      const currentBoard = optimisticBoardRef.current
+        ?? (gameStatus?.board ? gameStatus.board.flat() : null);
+      if (currentBoard) {
+        const myPos = currentBoard.indexOf(myPlayerId);
+        if (myPos >= 0) {
+          const beam = getBeamCells(myPos, direction, currentBoard);
+          if (beam.length > 0) {
+            if (powerBeamTimerRef.current) clearTimeout(powerBeamTimerRef.current);
+            setPowerBeam(beam);
+            powerBeamTimerRef.current = setTimeout(() => setPowerBeam(null), 700);
+          }
+        }
+      }
+
+      (async () => {
+        try {
+          const res = await fetch(`${RELAYER_URL}/use-power`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ playerId: myPlayerId, direction, gameId }),
+          });
+          const data = await res.json();
+          if (data.ok) {
+            addLog(`⚡ Power fired ${moveLabel(direction)}! (${(data.txHash as string)?.slice(0, 8)}...)`);
+          } else {
+            addLog(`Power failed: ${(data.error as string)?.slice(0, 60)}`);
+          }
+        } catch (e: any) {
+          addLog(`Power failed: ${e?.message?.slice(0, 60) ?? "error"}`);
+        }
+      })();
+    },
+    [myPlayerId, myPowerupScore, gameStatus?.isActive, gameStatus?.board, gameId, addLog]
+  );
+
+  // Keyboard controls — WASD = move, Arrow Keys = use power
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
 
+      // WASD → movement
       let move: number | null = null;
       switch (e.key) {
-        case "ArrowUp":
-        case "w":
-        case "W":
-          move = -12;
-          break;
-        case "ArrowDown":
-        case "s":
-        case "S":
-          move = 12;
-          break;
-        case "ArrowLeft":
-        case "a":
-        case "A":
-          move = -1;
-          break;
-        case "ArrowRight":
-        case "d":
-        case "D":
-          move = 1;
-          break;
+        case "w": case "W": move = -12; break;
+        case "s": case "S": move = 12; break;
+        case "a": case "A": move = -1; break;
+        case "d": case "D": move = 1; break;
       }
       if (move !== null) {
         e.preventDefault();
         makeMove(move);
+        return;
+      }
+
+      // Arrow Keys → use power
+      let powerDir: number | null = null;
+      switch (e.key) {
+        case "ArrowUp":    powerDir = -12; break;
+        case "ArrowDown":  powerDir = 12; break;
+        case "ArrowLeft":  powerDir = -1; break;
+        case "ArrowRight": powerDir = 1; break;
+      }
+      if (powerDir !== null) {
+        e.preventDefault();
+        usePower(powerDir);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [makeMove]);
+  }, [makeMove, usePower]);
 
   const flatBoard = useMemo(() => {
     if (optimisticBoard) return optimisticBoard;
@@ -601,6 +787,19 @@ const App: React.FC = () => {
         </div>
       )}
 
+      {showPowerupAcquired && (
+        <div key={powerupAcquiredKey} className="powerup-acquired-notification">
+          ⚡ Power charged! Use Arrow Keys to fire!
+        </div>
+      )}
+
+      {showBombAnim && (
+        <div key={bombAnimKey} className="bomb-explosion-overlay" aria-hidden="true">
+          <div className="bomb-explosion-emoji">💥</div>
+          <div className="bomb-explosion-text">💥 BOOM! Warped back to start!</div>
+        </div>
+      )}
+
       {/* ─── Fund Transfer Animation ─── */}
       {showTransferAnim && (
         <div className="transfer-overlay" aria-hidden="true">
@@ -619,7 +818,7 @@ const App: React.FC = () => {
             </div>
           ))}
           <div className="transfer-message">
-            💸 Payout sent! Money flying to player wallets…
+            💸 Payout sent!
           </div>
         </div>
       )}
@@ -636,6 +835,7 @@ const App: React.FC = () => {
           : null;
         const isMyWin = winnerId != null && myPlayerId === winnerId;
         const payoutTxSent = !!gameStatus?.lastCompletedGame?.txTrace?.rewardTxHash;
+        const hasAnyPayout = players.some((p) => Number(p.score) > 0);
         return (
           <div
             className="game-over-overlay"
@@ -663,12 +863,14 @@ const App: React.FC = () => {
                   🤝 Draw game! No single winner.
                 </div>
               )}
-              <div className="status-row" style={{ marginBottom: 8 }}>
-                <span className="label">Payout:</span>
-                <span className="value">
-                  {payoutTxSent ? "Sent on-chain ✅" : "Pending/processing..."}
-                </span>
-              </div>
+              {hasAnyPayout && (
+                <div className="status-row" style={{ marginBottom: 8 }}>
+                  <span className="label">Payout:</span>
+                  <span className="value">
+                    {payoutTxSent ? "Sent on-chain ✅" : "Pending/processing..."}
+                  </span>
+                </div>
+              )}
               <div className="final-scores-modal">
                 {sorted.map((p, i) => (
                   <div
@@ -824,6 +1026,9 @@ const App: React.FC = () => {
                     style={{ color: PLAYER_COLORS[i] }}
                   >
                     {PLAYER_LABELS[i]}
+                    {Number(p.powerupScore ?? 0) > 0 && (
+                      <span className="player-power-badge" title="Power charged!"> ⚡</span>
+                    )}
                   </span>
                   <span className="player-score">
                     Score: <b>{p.score}</b>
@@ -862,11 +1067,18 @@ const App: React.FC = () => {
 
                 const isPlayer = cell >= 1 && cell <= 4;
                 const isKingTile = kingTileIndex != null && idx === kingTileIndex;
+                const isPowerupTile = cell === POWERUP_MARK;
+                const isBombTile = cell === BOMB_MARK;
+                const beamIdx = powerBeam ? powerBeam.indexOf(idx) : -1;
+                const isBeamCell = beamIdx >= 0;
+                // Beam hits the last cell (enemy player) — show a "hit" flash
+                const isBeamHit = isBeamCell && powerBeam != null && beamIdx === powerBeam.length - 1 && isPlayer;
 
                 if (isPlayer) {
                   cls += ` player-cell p${cell}`;
                   if (myPlayerId === cell) cls += " me";
                   if (isKingTile) cls += " king-occupied";
+                  if (isBeamHit) cls += " beam-hit";
                   content = (
                     <>
                       {isKingTile && <span className="cell-king-corner">👑</span>}
@@ -875,15 +1087,27 @@ const App: React.FC = () => {
                   );
                 } else if (cell === KING_MARK) {
                   cls += " king";
+                  if (isBeamCell) cls += " laser-beam";
                   content = "👑";
                 } else if (isKingTile) {
-                  // If we know the king tile index, keep it visually marked even if the board value is empty.
                   cls += " king";
                   content = "👑";
+                } else if (isPowerupTile) {
+                  cls += " powerup";
+                  content = "⚡";
+                } else if (isBombTile) {
+                  cls += " bomb";
+                  content = "💣";
+                } else if (isBeamCell) {
+                  cls += " laser-beam";
                 }
 
                 return (
-                  <div key={idx} className={cls}>
+                  <div
+                    key={idx}
+                    className={cls}
+                    style={isBeamCell ? { "--beam-idx": beamIdx } as React.CSSProperties : undefined}
+                  >
                     {content}
                   </div>
                 );
@@ -895,34 +1119,51 @@ const App: React.FC = () => {
           {gameStatus?.isActive && myPlayerId && (
             <div className="controls">
               <p className="controls-hint">
-                Use <b>WASD</b> or <b>Arrow Keys</b> to move — no wallet popups!
+                <b>WASD</b> = Move &nbsp;|&nbsp; <b>Arrow Keys</b> = Fire Power ⚡
               </p>
-              <div className="dpad">
-                <button
-                  className="dpad-btn up"
-                  onClick={() => makeMove(-12)}
-                >
-                  ▲
-                </button>
-                <div className="dpad-mid">
-                  <button
-                    className="dpad-btn left"
-                    onClick={() => makeMove(-1)}
-                  >
-                    ◄
-                  </button>
-                  <button
-                    className="dpad-btn down"
-                    onClick={() => makeMove(12)}
-                  >
-                    ▼
-                  </button>
-                  <button
-                    className="dpad-btn right"
-                    onClick={() => makeMove(1)}
-                  >
-                    ►
-                  </button>
+
+              {/* Power bar */}
+              <div className="power-bar-row">
+                <span className="power-bar-label">⚡ Power</span>
+                <div className="power-bar-track">
+                  {[0, 1, 2, 3].map((i) => (
+                    <div
+                      key={i}
+                      className={`power-bar-segment ${i < myPowerupScore ? "filled" : ""}`}
+                    />
+                  ))}
+                </div>
+                <span className={`power-bar-value ${myPowerupScore > 0 ? "charged" : ""}`}>
+                  {myPowerupScore > 0 ? "READY" : "EMPTY"}
+                </span>
+              </div>
+
+              {/* Dual dpad: WASD (move) + Arrow (power) */}
+              <div className="dual-dpad">
+                {/* WASD dpad */}
+                <div className="dpad-group">
+                  <div className="dpad-group-label">Move</div>
+                  <div className="dpad">
+                    <button className="dpad-btn up" onClick={() => makeMove(-12)}>W</button>
+                    <div className="dpad-mid">
+                      <button className="dpad-btn left" onClick={() => makeMove(-1)}>A</button>
+                      <button className="dpad-btn down" onClick={() => makeMove(12)}>S</button>
+                      <button className="dpad-btn right" onClick={() => makeMove(1)}>D</button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Arrow dpad — power fire */}
+                <div className="dpad-group">
+                  <div className="dpad-group-label">Power ⚡</div>
+                  <div className={`dpad ${myPowerupScore > 0 ? "dpad-powered" : "dpad-dim"}`}>
+                    <button className="dpad-btn up power-btn" onClick={() => usePower(-12)}>▲</button>
+                    <div className="dpad-mid">
+                      <button className="dpad-btn left power-btn" onClick={() => usePower(-1)}>◄</button>
+                      <button className="dpad-btn down power-btn" onClick={() => usePower(12)}>▼</button>
+                      <button className="dpad-btn right power-btn" onClick={() => usePower(1)}>►</button>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1004,10 +1245,16 @@ const App: React.FC = () => {
                   </li>
                   <li>The game starts once 2 players join and runs for a fixed time.</li>
                   <li>
-                    Move using <strong>WASD</strong> or <strong>Arrow Keys</strong>.
+                    Move using <strong>WASD</strong>. Fire power with <strong>Arrow Keys</strong>.
                   </li>
                   <li>
                     Stand on the <span className="king-em">👑 King Tile</span> to earn +1 score per second.
+                  </li>
+                  <li>
+                    Step on <span style={{ color: "#64dc64" }}>⚡ Powerup</span> (every 5s) to charge your power, then use Arrow Keys to blast an enemy in that direction.
+                  </li>
+                  <li>
+                    Watch out for the <span style={{ color: "#ff5050" }}>💣 Bomb</span> (every 10s) — landing on it warps you back to your starting position!
                   </li>
                   <li>Collide with another player to push them back 2 steps.</li>
                   <li>Beware — other players can push you back 2 steps too.</li>

@@ -25,7 +25,7 @@ mod state;
 use constants::*;
 use movement::*;
 use state::*;
-declare_id!("DsJTFyZpypWWBHF2PouwpcUNZ9L6FZx1aPcH55zdjCTU");
+declare_id!("AN5cqzkh1fMg631UP9NcwDCaDBu1idTyJqcDqyYA9g5M");
 
 #[ephemeral]
 #[program]
@@ -90,6 +90,7 @@ pub mod king_tiles {
             score: 0,
             current_position: board_account.players_count as i16, // Spawn position is deterministic by registration order.
             id: players_count.checked_add(1).unwrap() as u8, // Player ids are 1-based for board encoding.
+            powerup_score: 0,
         };
         board_account.players[players_count as usize] = player;
         board_account.board[player.current_position as usize] = player.id;
@@ -124,6 +125,7 @@ pub mod king_tiles {
     ) -> Result<()> {
         let _ = game_id;
         let board = &mut ctx.accounts.board_account;
+        
         let clock = Clock::get()?;
         require!(
             clock.unix_timestamp < board.game_end_timestamp,
@@ -145,36 +147,17 @@ pub mod king_tiles {
             move_position.abs() == 12 || move_position.abs() == 1,
             KingTilesError::InvalidMove
         );
-
+        let payer_key = ctx.accounts.payer.key();
         let current_position = board.players[player_index].current_position;
         let new_position = current_position
             .checked_add(move_position)
             .unwrap()
             .rem_euclid(BOARD_SIZE as i16) as usize;
 
-        // Resolve movement based on what currently occupies the destination cell.
-        if board.board[new_position] == EMPTY {
-            new_position_is_empty(board, player_id, current_position, new_position);
-        } else if board.board[new_position] != EMPTY && board.board[new_position] != KING_MARK {
-            new_position_is_not_empty_and_not_king(
-                board,
-                player_id,
-                current_position,
-                move_position,
-                new_position,
-            );
-        }
-        //else board.board[new_position] == KING_MARK
-        else {
-            new_position_is_king(board, player_id, current_position, new_position);
-            emit!(PlayerScoredEvent {
-                player: ctx.accounts.payer.key(),
-                game_id: board.game_id,
-            });
-        }
+        check_board_for_new_position(payer_key,board,player_index,new_position,move_position);
 
         emit!(MoveMadeEvent {
-            player: ctx.accounts.payer.key(),
+            player: payer_key,
             game_id: board.game_id,
         });
 
@@ -182,8 +165,8 @@ pub mod king_tiles {
     }
 
     /// Request VRF randomness to move the king tile. The callback moves the king and emits an event.
-    pub fn request_randomness(
-        ctx: Context<RequestRandomness>,
+    pub fn request_randomness_for_king_move(
+        ctx: Context<RequestRandomnessForKingMove>,
         client_seed: u8,
         game_id: u64,
     ) -> Result<()> {
@@ -217,10 +200,104 @@ pub mod king_tiles {
         Ok(())
     }
 
+    pub fn request_randomness_for_powerup_move(
+        ctx: Context<RequestRandomnessForPowerupMove>,
+        client_seed: u8,
+        game_id: u64,
+    ) -> Result<()> {
+        msg!(
+            "Requesting VRF randomness for powerup move, game_id: {}",
+            game_id
+        );
+        let ix = create_request_randomness_ix(RequestRandomnessParams {
+            payer: ctx.accounts.treasury_signer.key(),
+            oracle_queue: ctx.accounts.oracle_queue.key(),
+            callback_program_id: ID,
+            callback_discriminator: instruction::CallbackSpawnPowerup::DISCRIMINATOR.to_vec(),
+            caller_seed: [client_seed; 32],
+            accounts_metas: Some(vec![
+                // treasury (non-signer) so callback can derive the board PDA
+                SerializableAccountMeta {
+                    pubkey: ctx.accounts.treasury_signer.key(),
+                    is_signer: false,
+                    is_writable: false,
+                },
+                SerializableAccountMeta {
+                    pubkey: ctx.accounts.board_account.key(),
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ]),
+            ..Default::default()
+        });
+        ctx.accounts
+            .invoke_signed_vrf(&ctx.accounts.treasury_signer.to_account_info(), &ix)?;
+        Ok(())
+    }
+
+    pub fn request_randomness_for_bomb_drop(
+        ctx: Context<RequestRandomnessForBombDrop>,
+        client_seed: u8,
+        game_id: u64,
+    ) -> Result<()> {
+        msg!(
+            "Requesting VRF randomness for bomb drop, game_id: {}",
+            game_id
+        );
+        let ix = create_request_randomness_ix(RequestRandomnessParams {
+            payer: ctx.accounts.treasury_signer.key(),
+            oracle_queue: ctx.accounts.oracle_queue.key(),
+            callback_program_id: ID,
+            callback_discriminator: instruction::CallbackBombDrop::DISCRIMINATOR.to_vec(),
+            caller_seed: [client_seed; 32],
+            accounts_metas: Some(vec![
+                // treasury (non-signer) so callback can derive the board PDA
+                SerializableAccountMeta {
+                    pubkey: ctx.accounts.treasury_signer.key(),
+                    is_signer: false,
+                    is_writable: false,
+                },
+                SerializableAccountMeta {
+                    pubkey: ctx.accounts.board_account.key(),
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ]),
+            ..Default::default()
+        });
+        ctx.accounts
+            .invoke_signed_vrf(&ctx.accounts.treasury_signer.to_account_info(), &ix)?;
+        Ok(())
+    }
+
     /// VRF callback which moves the king tile to a random empty cell.
     ///
     /// This instruction cannot be called directly by users; the `CallbackKingMove` context enforces
     /// the caller is the VRF program identity.
+    pub fn callback_bomb_drop(ctx: Context<CallbackBombDrop>, randomness: [u8; 32]) -> Result<()> {
+        let board = &mut ctx.accounts.board_account;
+        let bomb_current_position = board.bomb_current_position;
+        let mut cell_index = ephemeral_vrf_sdk::rnd::random_u8_with_range(
+            &randomness,
+            0,
+            (BOARD_SIZE.checked_sub(1).unwrap()) as u8,
+        ) as usize;
+        // Only clear the bomb mark if no player has landed on the tile
+        if board.board[bomb_current_position as usize] == BOMB_MARK {
+            board.board[bomb_current_position as usize] = EMPTY;
+        }
+        // Ensure the bomb lands on an empty cell by linearly probing from the sampled index.
+        while board.board[cell_index] != EMPTY {
+            cell_index = (cell_index.checked_add(1).unwrap()) as usize % BOARD_SIZE;
+        }
+        board.board[cell_index] = BOMB_MARK;
+        board.bomb_current_position = cell_index as u8;
+        emit!(BombDropEvent {
+            game_id: board.game_id,
+            bomb_drop: board.bomb_current_position as u8,
+        });
+        Ok(())
+    }
     pub fn callback_king_move(ctx: Context<CallbackKingMove>, randomness: [u8; 32]) -> Result<()> {
         let board = &mut ctx.accounts.board_account;
         let king_current_position = board.king_current_position;
@@ -242,6 +319,31 @@ pub mod king_tiles {
         emit!(KingMoveEvent {
             game_id: board.game_id,
             king_move: board.king_current_position as u8,
+        });
+        Ok(())
+    }
+
+    pub fn callback_spawn_powerup(ctx: Context<CallbackPowerupMove>, randomness: [u8; 32]) -> Result<()> {
+        let board = &mut ctx.accounts.board_account;
+        let powerup_current_position = board.powerup_current_position;
+        let mut cell_index = ephemeral_vrf_sdk::rnd::random_u8_with_range(
+            &randomness,
+            0,
+            (BOARD_SIZE.checked_sub(1).unwrap()) as u8,
+        ) as usize;
+        // Only clear the previous generated random powerupmark if no player has landed on the tile
+        if board.board[powerup_current_position as usize] == POWERUP_MARK {
+            board.board[powerup_current_position as usize] = EMPTY;
+        }
+        // Ensure the king lands on an empty cell by linearly probing from the sampled index.
+        while board.board[cell_index] != EMPTY {
+            cell_index = (cell_index.checked_add(1).unwrap()) as usize % BOARD_SIZE;
+        }
+        board.board[cell_index] = POWERUP_MARK;
+        board.powerup_current_position = cell_index as u8;
+        emit!(PowerupMoveEvent {
+            game_id: board.game_id,
+            powerup_move: board.powerup_current_position as u8,
         });
         Ok(())
     }
@@ -363,8 +465,62 @@ pub mod king_tiles {
         msg!("Closing board for game_id: {}", game_id);
         Ok(())
     }
+    
+    pub fn use_power(ctx: Context<UsePower>, game_id: u64, player_id: u8,power_use_direction: i16) -> Result<()> {
+        let _ = game_id;
+        let board = &mut ctx.accounts.board_account;
+        let player_index = player_id_to_index(player_id);
+        require!(board.players[player_index].powerup_score > 0, KingTilesError::NoPowerup);
+        require!(power_use_direction.abs() == 12 || power_use_direction.abs() == 1, KingTilesError::InvalidPowerupMove);
+       
+        use_power_with_direction(board, player_index, power_use_direction);
+        // if power_use_direction == 12{
+        //     poweruse_direction_downwards(board, player_index, POWER_USE_DIRECTION_DOWNWARDS);
+        // }else if power_use_direction == 1{
+        //     powerup_direction_rightwards(board, player_index, POWER_USE_DIRECTION_RIGHTWARDS);
+        // } 
+        // else if power_use_direction == -12{
+        //     powerup_direction_upwards(board, player_index, POWER_USE_DIRECTION_UPWARDS);
+        // }
+        // else if power_use_direction == -1{
+        //     powerup_direction_leftwards(board, player_index, POWER_USE_DIRECTION_LEFTWARDS);
+        // }
+   
+        emit!(PowerUsedEvent {
+            player: player_id,
+            game_id: board.game_id,
+        });
+        Ok(())
+    }
 }
 
+#[vrf]
+#[derive(Accounts)]
+#[instruction(client_seed: u8, game_id: u64)]
+/// Accounts for requesting VRF randomness.
+pub struct RequestRandomnessForBombDrop<'info> {
+    #[account(mut, address = TREASURY)]
+    pub treasury_signer: Signer<'info>,
+
+    #[account(mut, seeds = [b"board", treasury_signer.key().as_ref(), &game_id.to_le_bytes()], bump)]
+    pub board_account: Account<'info, Board>,
+
+    /// CHECK: The oracle queue
+    #[account(mut, address = ephemeral_vrf_sdk::consts::DEFAULT_EPHEMERAL_QUEUE)]
+    pub oracle_queue: AccountInfo<'info>,
+}
+    
+
+#[derive(Accounts)]
+#[instruction(game_id: u64)]
+/// Accounts for using a powerup.
+pub struct UsePower<'info> {
+    #[account(mut, address = TREASURY)]
+    pub treasury: Signer<'info>,
+
+    #[account(mut, seeds = [b"board", treasury.key().as_ref(), &game_id.to_le_bytes()], bump)]
+    pub board_account: Account<'info, Board>,
+}
 #[derive(Accounts)]
 #[instruction(game_id: u64)]
 /// Accounts for closing the board PDA.
@@ -407,7 +563,7 @@ pub struct SetKingPosition<'info> {
 #[derive(Accounts)]
 #[instruction(client_seed: u8, game_id: u64)]
 /// Accounts for requesting VRF randomness.
-pub struct RequestRandomness<'info> {
+pub struct RequestRandomnessForKingMove<'info> {
     #[account(mut, address = TREASURY)]
     pub treasury_signer: Signer<'info>,
 
@@ -417,6 +573,37 @@ pub struct RequestRandomness<'info> {
     /// CHECK: The oracle queue
     #[account(mut, address = ephemeral_vrf_sdk::consts::DEFAULT_EPHEMERAL_QUEUE)]
     pub oracle_queue: AccountInfo<'info>,
+}
+
+#[vrf]
+#[derive(Accounts)]
+#[instruction(client_seed: u8, game_id: u64)]
+/// Accounts for requesting VRF randomness.
+pub struct RequestRandomnessForPowerupMove<'info> {
+    #[account(mut, address = TREASURY)]
+    pub treasury_signer: Signer<'info>,
+
+    #[account(mut, seeds = [b"board", treasury_signer.key().as_ref(), &game_id.to_le_bytes()], bump)]
+    pub board_account: Account<'info, Board>,
+
+    /// CHECK: The oracle queue
+    #[account(mut, address = ephemeral_vrf_sdk::consts::DEFAULT_EPHEMERAL_QUEUE)]
+    pub oracle_queue: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+/// Accounts for VRF callback that mutates the board.
+pub struct CallbackBombDrop<'info> {
+    /// Enforces the callback is executed by the VRF program via CPI — not callable by anyone else
+    #[account(address = ephemeral_vrf_sdk::consts::VRF_PROGRAM_IDENTITY)]
+    pub vrf_program_identity: Signer<'info>,
+
+    /// CHECK: Treasury key passed as non-signer; used only to derive the board PDA
+    #[account(address = TREASURY)]
+    pub treasury: AccountInfo<'info>,
+
+    #[account(mut, seeds = [b"board", treasury.key().as_ref(), &board_account.game_id.to_le_bytes()], bump)]
+    pub board_account: Account<'info, Board>,
 }
 
 #[derive(Accounts)]
@@ -432,6 +619,23 @@ pub struct CallbackKingMove<'info> {
 
     #[account(mut, seeds = [b"board", treasury.key().as_ref(), &board_account.game_id.to_le_bytes()], bump)]
     pub board_account: Account<'info, Board>,
+}
+
+#[derive(Accounts)]
+/// Accounts for VRF callback that mutates the board.
+pub struct CallbackPowerupMove<'info> {
+    /// Enforces the callback is executed by the VRF program via CPI — not callable by anyone else
+    #[account(address = ephemeral_vrf_sdk::consts::VRF_PROGRAM_IDENTITY)]
+    pub vrf_program_identity: Signer<'info>,
+
+    /// CHECK: Treasury key passed as non-signer; used only to derive the board PDA
+    #[account(address = TREASURY)]
+    pub treasury: AccountInfo<'info>,
+
+    #[account(mut, seeds = [b"board", treasury.key().as_ref(), &board_account.game_id.to_le_bytes()], bump)]
+    pub board_account: Account<'info, Board>,
+
+    
 }
 
 #[derive(Accounts)]

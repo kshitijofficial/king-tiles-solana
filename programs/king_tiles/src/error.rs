@@ -29,4 +29,10 @@ pub enum KingTilesError {
 
     #[msg("Invalid move")]
     InvalidMove,
+
+    #[msg("No powerup available")]
+    NoPowerup,
+
+    #[msg("Invalid powerup move")]
+    InvalidPowerupMove,
 }

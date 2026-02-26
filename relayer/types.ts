@@ -22,9 +22,10 @@ export type BoardStatusPayload = {
     player: string;
     score: string;
     currentPosition: number;
+    powerupScore: string;
   }>;
   board: number[][];
-  boardLegend: { 0: string; "1-4": string; 5: string };
+  boardLegend: { 0: string; "1-4": string; 5: string; 6: string; 7: string };
 };
 
 export type CompletedGameSnapshot = BoardStatusPayload & {
