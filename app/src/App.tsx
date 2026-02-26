@@ -10,10 +10,13 @@ import {
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
 import "./App.css";
-import { BackgroundMusic } from "./BackgroundMusic";
-import { useMoveSound } from "./useMoveSound";
-import { useKingPowerSound } from "./useKingPowerSound";
-import { useEmergencyCountdownSound } from "./useEmergencyCountdownSound";
+import { BackgroundMusic } from "./audio/BackgroundMusic";
+import { useMoveSound } from "./audio/useMoveSound";
+import { useKingPowerSound } from "./audio/useKingPowerSound";
+import { useEmergencyCountdownSound } from "./audio/useEmergencyCountdownSound";
+import { useBumpSound } from "./audio/useBumpSound";
+import { useLaserSound } from "./audio/useLaserSound";
+import { useBombSound } from "./audio/useBombSound";
 import {
   BOARD_SIZE,
   BOMB_MARK,
@@ -95,6 +98,7 @@ const App: React.FC = () => {
   const prevPlayerPositionsRef = useRef<Map<number, number> | null>(null);
   const prevPlayerScoresRef = useRef<Map<number, number> | null>(null);
   const prevPowerupScoresRef = useRef<Map<number, number> | null>(null);
+  const prevPowerupScoresForLaserRef = useRef<Map<number, number> | null>(null);
   const prevFlatBoardRef = useRef<number[] | null>(null);
   const kingStreakRef = useRef<Map<number, number>>(new Map());
   const kingTileIndexRef = useRef<number | null>(null);
@@ -110,6 +114,9 @@ const App: React.FC = () => {
   const { playMoveSound } = useMoveSound(0.1);
   const { playKingPower } = useKingPowerSound(0.15);
   const { playEmergencyTick } = useEmergencyCountdownSound(0.17);
+  const { playBumpSound } = useBumpSound(0.16);
+  const { playLaserSound } = useLaserSound(0.15);
+  const { playBombSound } = useBombSound(0.17);
 
   const displayGame = useMemo<CompletedGameSnapshot | GameStatus | null>(() => {
     if (!gameStatus) return null;
@@ -324,14 +331,39 @@ const App: React.FC = () => {
       }
     }
 
+    // Collision bump: player A moves into player B's old cell and B is displaced.
+    let hadBump = false;
+    const prevPosToPlayer = new Map<number, number>();
+    prevMap.forEach((pos, id) => {
+      prevPosToPlayer.set(pos, id);
+    });
+
+    for (const p of players) {
+      const prevPos = prevMap.get(p.id);
+      if (prevPos === undefined || prevPos === p.currentPosition) continue;
+      const displacedPlayerId = prevPosToPlayer.get(p.currentPosition);
+      if (!displacedPlayerId || displacedPlayerId === p.id) continue;
+      const displacedPrevPos = prevMap.get(displacedPlayerId);
+      const displacedCurrPos = nextMap.get(displacedPlayerId);
+      if (
+        displacedPrevPos !== undefined &&
+        displacedCurrPos !== undefined &&
+        displacedCurrPos !== displacedPrevPos
+      ) {
+        hadBump = true;
+        break;
+      }
+    }
+
     // Polling can batch updates, so play up to 3 quick blips.
     const blips = Math.min(movedCount, 3);
     for (let i = 0; i < blips; i += 1) {
       window.setTimeout(() => playMoveSound(), i * 90);
     }
+    if (hadBump) playBumpSound();
 
     prevPlayerPositionsRef.current = nextMap;
-  }, [displayGame?.players, displayGame?.playersCount, displayGame?.isActive, playMoveSound]);
+  }, [displayGame?.players, displayGame?.playersCount, displayGame?.isActive, playMoveSound, playBumpSound]);
 
   // King scoring SFX: rising tone each second a player keeps scoring on king.
   useEffect(() => {
@@ -412,6 +444,35 @@ const App: React.FC = () => {
     }
   }, [displayGame?.players, displayGame?.playersCount, displayGame?.isActive, myPlayerId]);
 
+  // Laser SFX: detect remote power usage via powerupScore decreases.
+  useEffect(() => {
+    const players = displayGame?.players?.slice(0, displayGame?.playersCount ?? 0) ?? [];
+    if (!players.length || !displayGame?.isActive) {
+      prevPowerupScoresForLaserRef.current = null;
+      return;
+    }
+
+    const nextMap = new Map<number, number>();
+    for (const p of players) nextMap.set(p.id, Number(p.powerupScore ?? 0));
+
+    const prevMap = prevPowerupScoresForLaserRef.current;
+    prevPowerupScoresForLaserRef.current = nextMap;
+    if (!prevMap) return;
+
+    let laserFires = 0;
+    for (const p of players) {
+      if (myPlayerId && p.id === myPlayerId) continue;
+      const prev = prevMap.get(p.id) ?? 0;
+      const curr = nextMap.get(p.id) ?? 0;
+      if (curr < prev) laserFires += prev - curr;
+    }
+
+    const zaps = Math.min(laserFires, 3);
+    for (let i = 0; i < zaps; i += 1) {
+      window.setTimeout(() => playLaserSound(), i * 90);
+    }
+  }, [displayGame?.players, displayGame?.playersCount, displayGame?.isActive, myPlayerId, playLaserSound]);
+
   // Bomb landing — fires when MY player moves onto a cell that was a bomb tile last poll
   useEffect(() => {
     const flat = displayGame?.board ? displayGame.board.flat() : null;
@@ -428,10 +489,11 @@ const App: React.FC = () => {
     if (myNewPos >= 0 && prev[myNewPos] === BOMB_MARK) {
       setBombAnimKey((k) => k + 1);
       setShowBombAnim(true);
+      playBombSound();
       const t = setTimeout(() => setShowBombAnim(false), 1800);
       return () => clearTimeout(t);
     }
-  }, [displayGame?.board, displayGame?.isActive, myPlayerId]);
+  }, [displayGame?.board, displayGame?.isActive, myPlayerId, playBombSound]);
 
   useEffect(() => {
     return () => {
@@ -578,6 +640,7 @@ const App: React.FC = () => {
             setBombAnimKey((k) => k + 1);
             setShowBombAnim(true);
             window.setTimeout(() => setShowBombAnim(false), 1800);
+            playBombSound();
             board[currentPos] = EMPTY;
             board[newPos] = EMPTY;
             let landing = Math.max(0, myPlayerId - 1);
@@ -595,6 +658,7 @@ const App: React.FC = () => {
             board[pushPos] = target;
             board[currentPos] = EMPTY;
             board[newPos] = myPlayerId;
+            playBumpSound();
           }
 
           optimisticBoardRef.current = board;
@@ -648,7 +712,7 @@ const App: React.FC = () => {
         }
       })();
     },
-    [sessionKeypair, myPlayerId, gameStatus?.isActive, gameStatus?.board, boardPDA, gameId, erConnection, addLog]
+    [sessionKeypair, myPlayerId, gameStatus?.isActive, gameStatus?.board, boardPDA, gameId, erConnection, addLog, playBumpSound, playBombSound]
   );
 
   // Fire power in a direction via the relayer (treasury is required signer for use_power)
@@ -661,6 +725,7 @@ const App: React.FC = () => {
       }
 
       // ── Beam animation: light up the scanned cells immediately ──────────────
+      playLaserSound();
       const currentBoard = optimisticBoardRef.current
         ?? (gameStatus?.board ? gameStatus.board.flat() : null);
       if (currentBoard) {
@@ -693,7 +758,7 @@ const App: React.FC = () => {
         }
       })();
     },
-    [myPlayerId, myPowerupScore, gameStatus?.isActive, gameStatus?.board, gameId, addLog]
+    [myPlayerId, myPowerupScore, gameStatus?.isActive, gameStatus?.board, gameId, addLog, playLaserSound]
   );
 
   // Keyboard controls — WASD = move, Arrow Keys = use power
