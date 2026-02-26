@@ -5,6 +5,103 @@
   padding: 16px;
 }
 
+.landing-shell {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  min-height: 68vh;
+  padding: 24px 0 12px;
+}
+
+.landing-content {
+  flex: 1;
+  min-height: 360px;
+  border: 1px solid #1e2554;
+  border-radius: 12px;
+  background: radial-gradient(circle at 20% 20%, rgba(79, 195, 247, 0.2), rgba(15, 19, 50, 0.95));
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 40px;
+}
+
+.landing-title {
+  margin: 0;
+  font-size: clamp(1.8rem, 3vw, 2.6rem);
+  color: #ffd700;
+}
+
+.landing-subtitle {
+  margin: 14px 0 22px;
+  max-width: 520px;
+  color: #cfd8ff;
+  font-size: 1rem;
+}
+
+.landing-start-btn {
+  width: fit-content;
+  padding: 12px 28px;
+  border: none;
+  border-radius: 10px;
+  background: #ffd700;
+  color: #0f1332;
+  font-size: 1rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.2s, transform 0.1s;
+}
+
+.landing-start-btn:hover {
+  background: #ffe44d;
+  transform: translateY(-1px);
+}
+
+.landing-leaderboard {
+  width: 320px;
+  flex-shrink: 0;
+  border: 1px solid #1e2554;
+  border-radius: 12px;
+  background: #0f1332;
+  padding: 14px;
+}
+
+.landing-leaderboard h3 {
+  margin: 0 0 10px;
+  color: #ffd700;
+  font-size: 0.9rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.landing-leaderboard table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.84rem;
+}
+
+.landing-leaderboard th,
+.landing-leaderboard td {
+  text-align: left;
+  padding: 8px 6px;
+  border-bottom: 1px solid #1a2050;
+}
+
+.landing-leaderboard th {
+  color: #9ea9d9;
+  font-size: 0.74rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.landing-leaderboard-empty,
+.landing-leaderboard-empty-cell {
+  color: #808080;
+  font-size: 0.8rem;
+  text-align: center;
+  padding: 14px 6px;
+}
+
 .header {
   display: flex;
   align-items: center;
@@ -985,4 +1082,20 @@
 .background-music-toggle:hover {
   background: #1e2554;
   transform: scale(1.05);
+}
+
+@media (max-width: 980px) {
+  .landing-shell {
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .landing-content {
+    min-height: 300px;
+    padding: 28px 20px;
+  }
+
+  .landing-leaderboard {
+    width: 100%;
+  }
 }

@@ -57,6 +57,12 @@ function getBeamCells(fromPos: number, direction: number, board: number[]): numb
   return cells;
 }
 
+type LeaderboardRow = {
+  wallet: string;
+  best_score: number;
+  games_played: number;
+};
+
 const App: React.FC = () => {
   const { publicKey, sendTransaction } = useWallet();
   const { connection: devnetConnection } = useConnection();
@@ -89,6 +95,10 @@ const App: React.FC = () => {
   const [showBombAnim, setShowBombAnim] = useState(false);
   const [bombAnimKey, setBombAnimKey] = useState(0);
   const [powerBeam, setPowerBeam] = useState<number[] | null>(null);
+  const [showLanding, setShowLanding] = useState(true);
+  const [leaderboard, setLeaderboard] = useState<LeaderboardRow[]>([]);
+  const [leaderboardLoading, setLeaderboardLoading] = useState(true);
+  const [leaderboardError, setLeaderboardError] = useState<string | null>(null);
   const powerBeamTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const kingNotifTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const powerupNotifTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -517,6 +527,23 @@ const App: React.FC = () => {
     }
   }, []);
 
+  const fetchLeaderboard = useCallback(async () => {
+    try {
+      const res = await fetch(`${RELAYER_URL}/leaderboard`);
+      const data = await res.json();
+      if (res.ok && data.ok !== false) {
+        setLeaderboard(Array.isArray(data.leaderboard) ? data.leaderboard : []);
+        setLeaderboardError(null);
+      } else {
+        setLeaderboardError(data.error ?? "Leaderboard unavailable");
+      }
+    } catch {
+      setLeaderboardError("Cannot reach relayer leaderboard endpoint");
+    } finally {
+      setLeaderboardLoading(false);
+    }
+  }, []);
+
   // Poll relayer /game-status (only update board when we get ok response; keep last good state on 503)
   useEffect(() => {
     let active = true;
@@ -543,6 +570,20 @@ const App: React.FC = () => {
       clearInterval(id);
     };
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    const pollLeaderboard = async () => {
+      if (!active) return;
+      await fetchLeaderboard();
+    };
+    pollLeaderboard();
+    const id = setInterval(pollLeaderboard, 10_000);
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
+  }, [fetchLeaderboard]);
 
   // Countdown timer
   useEffect(() => {
@@ -826,6 +867,11 @@ const App: React.FC = () => {
     ? `Completed (Game ${displayGame.currentGameId})`
     : "No game";
 
+  const shortWallet = useCallback((wallet: string) => {
+    if (!wallet) return "-";
+    return `${wallet.slice(0, 6)}...${wallet.slice(-4)}`;
+  }, []);
+
   return (
     <div className="app">
       <BackgroundMusic />
@@ -964,6 +1010,59 @@ const App: React.FC = () => {
       })()}
 
       {/* ─── Wallet & registration ─── */}
+      {showLanding ? (
+        <div className="landing-shell">
+          <div className="landing-content">
+            <h2 className="landing-title">Play For The Crown</h2>
+            <p className="landing-subtitle">
+              Join King Tiles, hold the king tile, and earn on-chain rewards.
+            </p>
+            <button
+              type="button"
+              className="landing-start-btn"
+              onClick={() => setShowLanding(false)}
+            >
+              Start Game
+            </button>
+          </div>
+
+          <aside className="landing-leaderboard">
+            <h3>Top 5 Leaderboard</h3>
+            {leaderboardLoading && <div className="landing-leaderboard-empty">Loading...</div>}
+            {!leaderboardLoading && leaderboardError && (
+              <div className="landing-leaderboard-empty">{leaderboardError}</div>
+            )}
+            {!leaderboardLoading && !leaderboardError && (
+              <table>
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Wallet</th>
+                    <th>Best</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {leaderboard.length === 0 && (
+                    <tr>
+                      <td colSpan={3} className="landing-leaderboard-empty-cell">
+                        No scores yet
+                      </td>
+                    </tr>
+                  )}
+                  {leaderboard.map((row, idx) => (
+                    <tr key={row.wallet}>
+                      <td>{idx + 1}</td>
+                      <td className="mono">{shortWallet(row.wallet)}</td>
+                      <td>{row.best_score}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </aside>
+        </div>
+      ) : (
+        <>
       {publicKey && (
         <div className="identity-bar">
           <span className="label">Wallet:</span>
@@ -1341,6 +1440,8 @@ const App: React.FC = () => {
           </div>
         </div>
       </div>
+      </>
+      )}
     </div>
   );
 };

@@ -16,6 +16,7 @@ import { getBoardPDA, toBoardStatusPayload } from "./board";
 import { loadKeypair } from "./keypair";
 import { sleep } from "./sleep";
 import { CompletedGameSnapshot, TxTrace } from "./types";
+import { fetchTopLeaderboard, upsertLeaderboardFromBoard } from "../db/leaderboard";
 
 export async function bootstrapRelayer(): Promise<void> {
   const treasuryKeypair = loadKeypair(process.env.TREASURY_SECRET_BASE58);
@@ -269,6 +270,14 @@ export async function bootstrapRelayer(): Promise<void> {
           completedAtIso: new Date().toISOString(),
           txTrace: endPhaseTxTrace,
         };
+        try {
+          await upsertLeaderboardFromBoard(gameId, postEndBoard);
+        } catch (leaderboardError: any) {
+          console.error(
+            "  [Leaderboard] Failed to sync game results:",
+            leaderboardError?.message ?? leaderboardError
+          );
+        }
       } catch (snapshotErr: any) {
         console.warn(
           "  [Snapshot] Unable to capture post-end board:",
@@ -452,6 +461,22 @@ export async function bootstrapRelayer(): Promise<void> {
         gameStatus: "GET /game-status",
       },
     });
+  });
+
+  // GET /leaderboard - top players from DB read-model
+  app.get("/leaderboard", async (_req: Request, res: Response) => {
+    try {
+      const leaderboard = await fetchTopLeaderboard(5);
+      res.json({
+        ok: true,
+        leaderboard,
+      });
+    } catch (error: any) {
+      res.status(500).json({
+        ok: false,
+        error: error?.message ?? "Unable to fetch leaderboard",
+      });
+    }
   });
 
   // POST /start-session — relayer creates the board on devnet
@@ -725,4 +750,3 @@ export async function bootstrapRelayer(): Promise<void> {
     console.log(`\nListening for GameStartedEvent on devnet...\n`);
   });
 }
-
