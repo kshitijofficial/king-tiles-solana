@@ -4,7 +4,7 @@ import { PublicKey } from "@solana/web3.js";
 export const PROGRAM_ID = new PublicKey(
   typeof process !== "undefined" && process.env?.REACT_APP_PROGRAM_ID
     ? process.env.REACT_APP_PROGRAM_ID
-    : "DsJTFyZpypWWBHF2PouwpcUNZ9L6FZx1aPcH55zdjCTU"
+    : "AN5cqzkh1fMg631UP9NcwDCaDBu1idTyJqcDqyYA9g5M"
 );
 
 export const TREASURY_PUBKEY = new PublicKey(
@@ -26,6 +26,8 @@ export const MEMO_PROGRAM_ID = new PublicKey(
 
 export const EMPTY = 0;
 export const KING_MARK = 5;
+export const POWERUP_MARK = 6;
+export const BOMB_MARK = 7;
 
 export const REGISTRATION_FEE_LAMPORTS = 1_000_000; // 0.001 SOL
 

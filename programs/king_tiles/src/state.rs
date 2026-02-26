@@ -18,6 +18,9 @@ pub struct Player {
     pub current_position: i16,
     /// 1-based id used as the board cell marker.
     pub id: u8,
+   
+    /// Power up accrued over time while occupying the powerup tile.
+    pub powerup_score: u64,
 }
 
 #[account]
@@ -40,4 +43,9 @@ pub struct Board {
     pub last_move_timestamp: i64,
     /// Wall-clock unix timestamp (seconds) at which the game ends.
     pub game_end_timestamp: i64,
+
+    /// Current powerup tile index.
+    pub powerup_current_position: u8,
+    /// Current bomb tile index.
+    pub bomb_current_position: u8,
 }

@@ -3,6 +3,7 @@ export interface PlayerInfo {
   player: string;
   score: string;
   currentPosition: number;
+  powerupScore: string;
 }
 
 export interface TxTrace {

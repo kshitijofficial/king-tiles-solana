@@ -22,3 +22,21 @@ pub const TREASURY: Pubkey = pubkey!("86uKSrcwj3j6gaSkK5Ggvt4ni5rokpBhrk2X2jUjDU
 // 12x12 has an even width, so there is no single "middle" cell.
 // This picks the upper-left of the 2x2 center block: (row=5, col=5) => 5*12+5 = 65.
 pub const KING_STARTING_POSITION: usize = 65;
+
+/// Cell marker for the powerup tile.
+pub const POWERUP_MARK: u8 = 6;
+
+/// Power up score. Player can push another player four blocks with Power up score.
+pub const POWERUP_SCORE: u64 = 4;
+
+pub const POWER_USE_DIRECTION_DOWNWARDS: i16 = 12;
+pub const POWER_USE_DIRECTION_RIGHTWARDS: i16 = 1;
+pub const POWER_USE_DIRECTION_UPWARDS: i16 = -12;
+pub const POWER_USE_DIRECTION_LEFTWARDS: i16 = -1;
+
+/// Cell marker for the bomb tile.
+pub const BOMB_MARK: u8 = 7;
+
+
+
+

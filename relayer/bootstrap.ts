@@ -16,6 +16,7 @@ import { getBoardPDA, toBoardStatusPayload } from "./board";
 import { loadKeypair } from "./keypair";
 import { sleep } from "./sleep";
 import { CompletedGameSnapshot, TxTrace } from "./types";
+import { fetchTopLeaderboard, upsertLeaderboardFromBoard } from "../db/leaderboard";
 
 export async function bootstrapRelayer(): Promise<void> {
   const treasuryKeypair = loadKeypair(process.env.TREASURY_SECRET_BASE58);
@@ -75,12 +76,16 @@ export async function bootstrapRelayer(): Promise<void> {
     "5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc"
   );
   const KING_MOVE_INTERVAL_MS = 5_000;
+  const POWERUP_SPAWN_INTERVAL_MS = 7_000;
+  const BOMB_DROP_INTERVAL_MS = 10_000;
   const GAME_DURATION_MS = 60_000;
 
   // ─── Relayer state ─────────────────────────────────────────────────────────
   let currentGameId: number | null = null;
   let gameTimer: NodeJS.Timeout | null = null;
   let kingMoveInterval: NodeJS.Timeout | null = null;
+  let powerupSpawnInterval: NodeJS.Timeout | null = null;
+  let bombDropInterval: NodeJS.Timeout | null = null;
   let scoreInterval: NodeJS.Timeout | null = null;
   let currentGameTxTrace: TxTrace = {};
   let lastCompletedGame: CompletedGameSnapshot | null = null;
@@ -120,13 +125,12 @@ export async function bootstrapRelayer(): Promise<void> {
     scoreInterval = setInterval(() => updatePlayerScore(gameId, boardPDA), 1_000);
   }
 
-  // ─── Request randomness on the ER (called every 5s during game) ────────────
+  // ─── Request king move randomness on the ER (called every 5s during game) ──
   async function requestKingMove(gameId: number, boardPDA: PublicKey): Promise<void> {
     try {
       const clientSeed = Math.floor(Math.random() * 256); // random u8
-      // Use .rpc() so Anchor's provider handles blockhash fetching internally
       const txHash = await programER.methods
-        .requestRandomness(clientSeed, new anchor.BN(gameId))
+        .requestRandomnessForKingMove(clientSeed, new anchor.BN(gameId))
         .accountsPartial({
           treasurySigner: treasuryPubkey,
           boardAccount: boardPDA,
@@ -139,11 +143,57 @@ export async function bootstrapRelayer(): Promise<void> {
     }
   }
 
+  // ─── Request powerup spawn randomness on the ER (called every 5s during game) ──
+  async function requestPowerupSpawn(gameId: number, boardPDA: PublicKey): Promise<void> {
+    try {
+      const clientSeed = Math.floor(Math.random() * 256); // random u8
+      const txHash = await programER.methods
+        .requestRandomnessForPowerupMove(clientSeed, new anchor.BN(gameId))
+        .accountsPartial({
+          treasurySigner: treasuryPubkey,
+          boardAccount: boardPDA,
+          oracleQueue: EPHEMERAL_ORACLE_QUEUE,
+        })
+        .rpc({ skipPreflight: true, commitment: "confirmed" });
+      console.log(`  [Powerup] VRF request sent → seed=${clientSeed} txHash=${txHash}`);
+    } catch (err: any) {
+      console.error(`  [Powerup] VRF request failed for gameId ${gameId}:`, err.message ?? err);
+    }
+  }
+
+  // ─── Request bomb drop randomness on the ER (called every 10s during game) ──
+  async function requestBombDrop(gameId: number, boardPDA: PublicKey): Promise<void> {
+    try {
+      const clientSeed = Math.floor(Math.random() * 256); // random u8
+      const txHash = await programER.methods
+        .requestRandomnessForBombDrop(clientSeed, new anchor.BN(gameId))
+        .accountsPartial({
+          treasurySigner: treasuryPubkey,
+          boardAccount: boardPDA,
+          oracleQueue: EPHEMERAL_ORACLE_QUEUE,
+        })
+        .rpc({ skipPreflight: true, commitment: "confirmed" });
+      console.log(`  [Bomb] VRF request sent → seed=${clientSeed} txHash=${txHash}`);
+    } catch (err: any) {
+      console.error(`  [Bomb] VRF request failed for gameId ${gameId}:`, err.message ?? err);
+    }
+  }
+
   function stopAllIntervals(): void {
     if (kingMoveInterval) {
       clearInterval(kingMoveInterval);
       kingMoveInterval = null;
       console.log(`  [King] Interval stopped.`);
+    }
+    if (powerupSpawnInterval) {
+      clearInterval(powerupSpawnInterval);
+      powerupSpawnInterval = null;
+      console.log(`  [Powerup] Interval stopped.`);
+    }
+    if (bombDropInterval) {
+      clearInterval(bombDropInterval);
+      bombDropInterval = null;
+      console.log(`  [Bomb] Interval stopped.`);
     }
     stopScoreInterval();
   }
@@ -151,16 +201,36 @@ export async function bootstrapRelayer(): Promise<void> {
   function startKingMoveInterval(gameId: number, boardPDA: PublicKey): void {
     stopAllIntervals();
     console.log(
-      `  [King] Starting VRF interval every ${KING_MOVE_INTERVAL_MS / 1000}s for ${
-        GAME_DURATION_MS / 1000
-      }s...`
+      `  [King]   Starting VRF interval every ${KING_MOVE_INTERVAL_MS / 1000}s...`
     );
-    // Fire immediately, then every 5s
+    console.log(
+      `  [Powerup] Starting VRF interval every ${POWERUP_SPAWN_INTERVAL_MS / 1000}s...`
+    );
+    console.log(
+      `  [Bomb]   Starting VRF interval every ${BOMB_DROP_INTERVAL_MS / 1000}s...`
+    );
+
+    // Fire king move immediately, then every 5s
     requestKingMove(gameId, boardPDA);
     kingMoveInterval = setInterval(
       () => requestKingMove(gameId, boardPDA),
       KING_MOVE_INTERVAL_MS
     );
+
+    // Fire powerup spawn immediately, then every 5s
+    requestPowerupSpawn(gameId, boardPDA);
+    powerupSpawnInterval = setInterval(
+      () => requestPowerupSpawn(gameId, boardPDA),
+      POWERUP_SPAWN_INTERVAL_MS
+    );
+
+    // Fire bomb drop immediately, then every 10s
+    requestBombDrop(gameId, boardPDA);
+    bombDropInterval = setInterval(
+      () => requestBombDrop(gameId, boardPDA),
+      BOMB_DROP_INTERVAL_MS
+    );
+
     // Start score update ticker (every 1s)
     startScoreInterval(gameId, boardPDA);
   }
@@ -200,6 +270,14 @@ export async function bootstrapRelayer(): Promise<void> {
           completedAtIso: new Date().toISOString(),
           txTrace: endPhaseTxTrace,
         };
+        try {
+          await upsertLeaderboardFromBoard(gameId, postEndBoard);
+        } catch (leaderboardError: any) {
+          console.error(
+            "  [Leaderboard] Failed to sync game results:",
+            leaderboardError?.message ?? leaderboardError
+          );
+        }
       } catch (snapshotErr: any) {
         console.warn(
           "  [Snapshot] Unable to capture post-end board:",
@@ -383,6 +461,22 @@ export async function bootstrapRelayer(): Promise<void> {
         gameStatus: "GET /game-status",
       },
     });
+  });
+
+  // GET /leaderboard - top players from DB read-model
+  app.get("/leaderboard", async (_req: Request, res: Response) => {
+    try {
+      const leaderboard = await fetchTopLeaderboard(5);
+      res.json({
+        ok: true,
+        leaderboard,
+      });
+    } catch (error: any) {
+      res.status(500).json({
+        ok: false,
+        error: error?.message ?? "Unable to fetch leaderboard",
+      });
+    }
   });
 
   // POST /start-session — relayer creates the board on devnet
@@ -594,6 +688,52 @@ export async function bootstrapRelayer(): Promise<void> {
     }
   });
 
+  // POST /use-power — relayer fires use_power on ER using treasury keypair (required signer)
+  app.post("/use-power", async (req: Request, res: Response) => {
+    try {
+      if (currentGameId === null) {
+        res.status(400).json({ ok: false, error: "No active game." });
+        return;
+      }
+
+      const playerId = Number(req.body?.playerId);
+      const direction = Number(req.body?.direction);
+
+      if (!Number.isFinite(playerId) || !Number.isFinite(direction)) {
+        res.status(400).json({
+          ok: false,
+          error: "Invalid body. Expected { playerId: number, direction: number }",
+        });
+        return;
+      }
+
+      if (direction !== 1 && direction !== -1 && direction !== 12 && direction !== -12) {
+        res.status(400).json({
+          ok: false,
+          error: "Invalid direction. Must be ±1 (left/right) or ±12 (up/down).",
+        });
+        return;
+      }
+
+      const [boardPDA] = getBoardPDA(treasuryPubkey, program.programId, currentGameId);
+
+      const txHash = await programER.methods
+        .usePower(new anchor.BN(currentGameId), playerId, direction)
+        .accountsPartial({
+          treasury: treasuryPubkey,
+          boardAccount: boardPDA,
+        })
+        .rpc({ skipPreflight: true, commitment: "confirmed" });
+
+      console.log(`  [Power] usePower fired → playerId=${playerId} dir=${direction} txHash=${txHash}`);
+      res.json({ ok: true, txHash, gameId: currentGameId });
+    } catch (error: any) {
+      const detail = error?.message ?? "Unknown error";
+      console.error("[/use-power] Error:", detail);
+      res.status(500).json({ ok: false, error: detail });
+    }
+  });
+
   app.listen(PORT, async () => {
     console.log(`\nKing Tiles Relayer → http://localhost:${PORT}`);
     console.log(
@@ -610,4 +750,3 @@ export async function bootstrapRelayer(): Promise<void> {
     console.log(`\nListening for GameStartedEvent on devnet...\n`);
   });
 }
-

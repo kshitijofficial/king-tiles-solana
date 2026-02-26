@@ -44,9 +44,10 @@ export function toBoardStatusPayload(
       player: p.player.toBase58(),
       score: p.score.toString(),
       currentPosition: Number(p.currentPosition),
+      powerupScore: p.powerupScore.toString(),
     })),
     board: toBoardGrid(board.board),
-    boardLegend: { 0: "empty", "1-4": "player id", 5: "king" },
+    boardLegend: { 0: "empty", "1-4": "player id", 5: "king", 6: "powerup", 7: "bomb" },
   };
 }
 
