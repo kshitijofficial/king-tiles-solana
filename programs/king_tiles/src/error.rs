@@ -1,7 +1,6 @@
 use anchor_lang::prelude::*;
 
 #[error_code]
-/// Program-specific errors returned by instruction handlers.
 pub enum KingTilesError {
     #[msg("Maximum players already registered for this game")]
     MaxPlayersReached,

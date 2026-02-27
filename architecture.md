@@ -1,69 +1,137 @@
-# King Tiles — Architecture
+# King Tiles - Architecture
 
-King Tiles is a small on-chain game that uses:
+King Tiles is a hybrid Solana game:
 
-- **Solana devnet** for player registration and reward distribution (L1 / base layer)
-- **Magicblock Ephemeral Rollup** for fast in-game moves + VRF-driven king movement
-- A **relayer** to orchestrate delegation, VRF ticks, scoring ticks, and end-of-game settlement
-- A **React UI** for players (with a deterministic “session key” per wallet)
+- Devnet is the base layer for session creation, player registration, and reward payout.
+- Magicblock Ephemeral Rollup (ER) is used for high-frequency gameplay writes.
+- A relayer runs the session lifecycle and serves read APIs.
+- A Supabase-backed leaderboard stores a persistent off-chain read model.
+- The React app renders state from relayer APIs and sends player transactions.
 
-## Components
+## Component map
 
-### On-chain program (`programs/king_tiles`)
+### 1) On-chain program (`programs/king_tiles`)
 
-- **Program id**: default is hardcoded in `programs/king_tiles/src/lib.rs` (can be overridden in the relayer via env).
-- **Treasury**: fixed pubkey constant in `programs/king_tiles/src/constants.rs`. Registration fees are paid into it; rewards are paid out from it.
-- **Core account**: a `Board` PDA per `game_id`, derived as:
-  - seeds: `["board", treasury_pubkey, game_id_le_bytes]`
+- Program id (current): `GAfcEqSSQJm2coiTRf4wL1SDX78jciwE6bN9eHwUaXi9`
+- Fixed treasury pubkey: `86uKSrcwj3j6gaSkK5Ggvt4ni5rokpBhrk2X2jUjDUoA`
+- Main state account: `Board` PDA per `game_id`
+  - Seeds: `["board", treasury_pubkey, game_id_le_bytes]`
 
-Key instructions (simplified):
+The program supports three game modes:
 
-- **`start_game_session(game_id)`**: initializes the board PDA on devnet.
-- **`register_player(game_id)`**: up to 2 players pay a registration fee into the treasury; when the 2nd registers, emits `GameStartedEvent` and starts a 60s timer.
-- **`delegate_board(game_id)`**: delegates the board PDA for ephemeral execution.
-- **`make_move(game_id, player_id, delta)`**: applies player movement (orthogonal, wraparound).
-- **`request_randomness(client_seed, game_id)`**: asks VRF for randomness; callback moves the king tile.
-- **`update_player_score(game_id)`**: treasury-gated tick that increments score for whoever stands on the king tile.
-- **`end_game_session(game_id)`**: exits + commits state back to devnet and undelegates.
-- **`distribute_rewards(game_id)`**: devnet settlement; pays each player `score * lamports_per_score`.
+- `8x8` board, `2` players
+- `10x10` board, `4` players
+- `12x12` board, `6` players
 
-### Relayer (`relayer.ts`, `relayer/`)
+Core instruction flow:
 
-The relayer is an Express service that holds the **treasury keypair** and orchestrates the game lifecycle:
+- `start_game_session(game_id, board_side_len, max_players, registration_fee_lamports, lamports_per_score)`
+- `register_player(game_id)` (registration fee transfer to treasury; game becomes active when `players_count == max_players`; 60s timer starts)
+- `delegate_board(game_id)` (devnet -> ER delegation)
+- `make_move(game_id, player_id, direction)` (up/down/left/right)
+- `request_randomness_for_king_move(...)` + callback
+- `request_randomness_for_powerup_move(...)` + callback
+- `request_randomness_for_bomb_drop(...)` + callback
+- `update_player_score(game_id)` (treasury-gated, 1 point if king tile is occupied by a player)
+- `use_power(game_id, player_id, direction)` (treasury-gated)
+- `end_game_session(game_id)` (commit + undelegate from ER)
+- `distribute_rewards(game_id)` (treasury pays each player `score * lamports_per_score`)
 
-- **Starts sessions**: `POST /start-session` calls `start_game_session` on devnet.
-- **Watches for start**: listens to `GameStartedEvent` on devnet.
-- **Delegates to ER**: on start event, sends `delegate_board` on devnet so the board can be mutated on the rollup.
-- **Runs the game loop** (while active):
-  - every ~5s: `request_randomness` on the rollup (moves the king via VRF callback)
-  - every ~1s: `update_player_score` on the rollup (treasury-gated)
-- **Ends + settles**:
-  - after ~60s: `end_game_session` on the rollup (commit back to devnet)
-  - then `distribute_rewards` on devnet (with retries)
-- **Serves read model**:
-  - `GET /game-status` fetches the board from ER first (if active) and falls back to devnet (if inactive).
+Gameplay rules encoded on-chain:
 
-### Web app (`app/`)
+- Normal collision bumps the collided player by 2 steps in move direction.
+- Powerup grants `powerup_score = 4`.
+- `use_power` pushes the first player in line by 4 tiles (or resolves through normal collision logic).
+- Bomb tile warps the stepped-on player back toward deterministic spawn slots (with probing for empty tile).
 
-The UI is intentionally thin and uses a deterministic **session keypair** derived from the connected wallet’s pubkey:
+### 2) Relayer (`relayer.ts`, `relayer/`)
 
-- **Registration**: sends a raw devnet transaction calling `register_player`.
-- **Moves**: sends raw rollup transactions calling `make_move` (plus an extra memo instruction to keep txs unique).
-- **State**: polls the relayer every second for `/game-status` to render the canonical board + scores.
+The relayer is an Express service using the treasury keypair. It orchestrates session runtime on ER and settlement on devnet.
 
-## Data model (board encoding)
+Session runtime responsibilities:
 
-The board is a flat `12 × 12` array (size 144) with these cell values:
+- Starts sessions via `POST /start-session`
+- Listens for `GameStartedEvent` on devnet
+- Delegates board when game starts
+- Starts periodic loops while active:
+  - King VRF request every 5s
+  - Powerup VRF request every 7s
+  - Bomb VRF request every 10s
+  - Score tick every 1s
+- Ends game when chain time reaches end timestamp, then settles rewards with retries
 
-- `0`: empty
-- `1..4`: player id
-- `5`: king tile marker (may be “covered” by a player when standing on it)
+Resilience behavior:
 
-## Configuration knobs
+- Recovers active/waiting sessions from chain at boot
+- Watchdog re-checks tracked sessions and resumes runtime if needed
+- Retries reward settlement and handles delegated-owner mismatch by re-finalizing from ER
+- Caches `/game-status` responses with short TTLs
 
-- **Relayer port**: `PORT` (default `8787`)
-- **Devnet RPC**: `RPC_URL` (default is in `relayer/config.ts`)
-- **Magicblock endpoints**: `ER_ENDPOINT`, `ER_WS_ENDPOINT` (defaults are in `relayer/config.ts`)
-- **Program id override**: `KING_TILES_PROGRAM_ID` / `PROGRAM_ID`
-- **React program id override**: `REACT_APP_PROGRAM_ID` (falls back to a hardcoded id in `app/src/game/constants.ts`)
+Relayer HTTP API:
 
+- `GET /` health + endpoint summary
+- `GET /games` active sessions + latest completed snapshots (including by mode)
+- `GET /game-status?gameId=<n>` board state (ER-first for active games, devnet fallback)
+- `GET /leaderboard` top players from DB read model
+- `POST /start-session` create board with mode + fee config
+- `POST /move` optional server-signed move path (requires player private keys in relayer env)
+- `POST /use-power` treasury-signed `use_power` call
+- `POST /retry-rewards` manual payout retry for ended games
+
+### 3) Leaderboard DB (`db/`)
+
+- Storage: Supabase PostgREST
+- Table: `leaderboard` (default name; configurable via env)
+- Upsert model per wallet:
+  - `best_score`
+  - `last_game_score`
+  - `last_game_id`
+  - `games_played`
+  - `updated_at`
+
+Write path:
+
+- After end/commit, relayer reads finalized devnet board and calls `upsertLeaderboardFromBoard`.
+
+Read path:
+
+- `GET /leaderboard` returns top N (`5` currently in relayer route).
+
+### 4) Web app (`app/`)
+
+App behavior:
+
+- Uses connected wallet only to derive/fund a deterministic session keypair (`Keypair.fromSeed(wallet.toBytes())`)
+- Registers player by sending raw devnet `register_player` tx from session key
+- Sends move txs directly to ER (`make_move`) from session key, with memo uniqueness and optimistic UI updates
+- Uses relayer for:
+  - game discovery (`/games`)
+  - canonical status (`/game-status`)
+  - leaderboard (`/leaderboard`)
+  - power usage (`/use-power`, because treasury signer is required by on-chain instruction)
+
+The app does not create sessions directly; session creation is done through relayer `POST /start-session`.
+
+## Board encoding
+
+Board storage is a fixed `[u8; 144]` array. Active cells are `board_side_len * board_side_len`.
+
+- `0` -> empty
+- `1..max_players` -> player id
+- `253` -> bomb
+- `254` -> powerup
+- `255` -> king
+
+Note: king may be visually tracked separately in the UI when a player occupies the king tile.
+
+## Configuration points
+
+- Relayer:
+  - `PORT`
+  - `TREASURY_SECRET_BASE58`
+  - `RPC_URL`
+  - `ER_ENDPOINT`, `ER_WS_ENDPOINT`
+  - `KING_TILES_PROGRAM_ID` or `PROGRAM_ID` override
+  - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_LEADERBOARD_TABLE`
+- App:
+  - `REACT_APP_PROGRAM_ID` override (otherwise uses hardcoded fallback in `app/src/game/constants.ts`)

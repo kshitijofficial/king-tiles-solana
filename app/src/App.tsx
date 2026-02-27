@@ -144,8 +144,6 @@ const extractCompletedByMode = (
   return byMode;
 };
 
-// Returns the board cell indices the power beam travels through, starting from
-// fromPos stepping by direction until it hits a board edge (or a player).
 function getBeamCells(
   fromPos: number,
   direction: number,
@@ -159,10 +157,8 @@ function getBeamCells(
   for (let step = 0; step < boardSize; step++) {
     pos += direction;
     if (pos < 0 || pos >= boardSize) break;
-    // Horizontal moves (±1) must stay on the same row
     if (Math.abs(direction) === 1 && Math.floor(pos / cols) !== Math.floor(fromPos / cols)) break;
     cells.push(pos);
-    // Beam stops at the first enemy player cell (it's the target)
     const cell = board[pos];
     if (cell >= 1 && cell <= maxPlayers && cell !== board[fromPos]) break;
   }
@@ -236,7 +232,6 @@ const App: React.FC = () => {
     Map<number, Pick<TxTrace, "rewardTxHash" | "rewardTxSolscanUrl">>
   >(new Map());
 
-  // Optimistic move system: cached blockhash + local board overlay
   const cachedBlockhashRef = useRef<{ blockhash: string; fetchedAt: number } | null>(null);
   const optimisticBoardRef = useRef<number[] | null>(null);
   const [optimisticBoard, setOptimisticBoard] = useState<number[] | null>(null);
@@ -385,7 +380,6 @@ const App: React.FC = () => {
     setLogs((prev) => [`${new Date().toLocaleTimeString()} ${msg}`, ...prev].slice(0, 30));
   }, []);
 
-  // Fund session keypair from wallet so it can pay registration fees and sign moves
   useEffect(() => {
     if (!sessionKeypair) {
       setSessionFunded(false);
@@ -425,22 +419,19 @@ const App: React.FC = () => {
     return () => { cancelled = true; };
   }, [sessionKeypair, devnetConnection, publicKey, sendTransaction, addLog]);
 
-  // Background ER blockhash cache — refreshes every 20s so moves never block on it
   useEffect(() => {
     let active = true;
     const refresh = async () => {
       try {
         const { blockhash } = await erConnection.getLatestBlockhash();
         if (active) cachedBlockhashRef.current = { blockhash, fetchedAt: Date.now() };
-      } catch { /* silent — will retry */ }
+      } catch {}
     };
     refresh();
     const id = setInterval(refresh, 20_000);
     return () => { active = false; clearInterval(id); };
   }, [erConnection]);
 
-  // Reconcile optimistic board with server state.
-  // Keep optimistic state briefly to avoid "step back" flicker from stale poll responses.
   useEffect(() => {
     if (!gameStatus?.board || !optimisticBoardRef.current) return;
 
@@ -464,7 +455,6 @@ const App: React.FC = () => {
     }
   }, [gameStatus?.board, myPlayerId]);
 
-  // King position notification — pops fresh every second the player is on the king tile
   useEffect(() => {
     if (!myPlayerId || !displayGame?.isActive || !displayGame?.playersCount) {
       if (kingNotifTimerRef.current) {
@@ -484,7 +474,6 @@ const App: React.FC = () => {
       }
       setShowPowerupAcquired(false);
       if (kingNotifTimerRef.current) clearTimeout(kingNotifTimerRef.current);
-      // Increment key to force remount → animation replays each second
       setKingNotifKey((k) => k + 1);
       setShowKingNotif(true);
       kingNotifTimerRef.current = setTimeout(() => {
@@ -495,7 +484,6 @@ const App: React.FC = () => {
     lastScoreRef.current = score;
   }, [displayGame?.players, displayGame?.isActive, myPlayerId, displayGame?.playersCount]);
 
-  // Detect active → inactive transition to trigger Game Over modal.
   useEffect(() => {
     const isActive = displayGame?.isActive;
     if (isActive === undefined || isActive === null) return;
@@ -529,7 +517,6 @@ const App: React.FC = () => {
     prevIsActiveRef.current = isActive;
   }, [displayGame]);
 
-  // Fallback: if transition was missed (refresh/poll race), show game-over modal once for ended settlement.
   useEffect(() => {
     if (showGameOverModal) return;
     const ended = settlement;
@@ -573,7 +560,6 @@ const App: React.FC = () => {
     return () => clearTimeout(timer);
   }, [settlement, showGameOverModal]);
 
-  // Move SFX: play a short sound each time any player position changes.
   useEffect(() => {
     const players = displayGame?.players?.slice(0, displayGame?.playersCount ?? 0) ?? [];
     if (!players.length || !displayGame?.isActive) {
@@ -598,7 +584,6 @@ const App: React.FC = () => {
       }
     }
 
-    // Collision bump: player A moves into player B's old cell and B is displaced.
     let hadBump = false;
     const prevPosToPlayer = new Map<number, number>();
     prevMap.forEach((pos, id) => {
@@ -622,7 +607,6 @@ const App: React.FC = () => {
       }
     }
 
-    // Polling can batch updates, so play up to 3 quick blips.
     const blips = Math.min(movedCount, 3);
     for (let i = 0; i < blips; i += 1) {
       window.setTimeout(() => playMoveSound(), i * 90);
@@ -632,7 +616,6 @@ const App: React.FC = () => {
     prevPlayerPositionsRef.current = nextMap;
   }, [displayGame?.players, displayGame?.playersCount, displayGame?.isActive, playMoveSound, playBumpSound]);
 
-  // King scoring SFX: rising tone each second a player keeps scoring on king.
   useEffect(() => {
     const players = displayGame?.players?.slice(0, displayGame?.playersCount ?? 0) ?? [];
     if (!players.length || !displayGame?.isActive) {
@@ -661,7 +644,6 @@ const App: React.FC = () => {
       const streak = oldStreak + delta;
       newStreaks.set(p.id, streak);
 
-      // If polling batches updates, play up to 3 quick power pings.
       const hits = Math.min(delta, 3);
       for (let i = 0; i < hits; i += 1) {
         const level = Math.min(streak - (hits - 1 - i), 10);
@@ -673,7 +655,6 @@ const App: React.FC = () => {
     prevPlayerScoresRef.current = nextScores;
   }, [displayGame?.players, displayGame?.playersCount, displayGame?.isActive, playKingPower]);
 
-  // Powerup acquired notification — fires when MY player's powerupScore goes from 0 → > 0
   useEffect(() => {
     const players = displayGame?.players?.slice(0, displayGame?.playersCount ?? 0) ?? [];
     if (!players.length || !displayGame?.isActive || !myPlayerId) {
@@ -711,7 +692,6 @@ const App: React.FC = () => {
     }
   }, [displayGame?.players, displayGame?.playersCount, displayGame?.isActive, myPlayerId]);
 
-  // Laser SFX: detect remote power usage via powerupScore decreases.
   useEffect(() => {
     const players = displayGame?.players?.slice(0, displayGame?.playersCount ?? 0) ?? [];
     if (!players.length || !displayGame?.isActive) {
@@ -740,7 +720,6 @@ const App: React.FC = () => {
     }
   }, [displayGame?.players, displayGame?.playersCount, displayGame?.isActive, myPlayerId, playLaserSound]);
 
-  // Bomb landing — fires when MY player moves onto a cell that was a bomb tile last poll
   useEffect(() => {
     const flat = displayGame?.board ? displayGame.board.flat() : null;
     if (!flat || !myPlayerId || !displayGame?.isActive) {
@@ -876,7 +855,6 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // Poll relayer /game-status (only update board when we get ok response; keep last good state on 503)
   useEffect(() => {
     if (!selectedMode) return;
     let active = true;
@@ -957,7 +935,6 @@ const App: React.FC = () => {
     };
   }, [fetchGamesOverview]);
 
-  // Countdown timer
   useEffect(() => {
     if (!gameStatus?.isActive || !gameStatus.gameEndTimestamp) {
       setCountdown(0);
@@ -975,7 +952,6 @@ const App: React.FC = () => {
     return () => clearInterval(id);
   }, [gameStatus?.isActive, gameStatus?.gameEndTimestamp]);
 
-  // Emergency beep for the last 10 seconds (once per second)
   useEffect(() => {
     if (!gameStatus?.isActive) return;
     if (countdown <= 10 && countdown > 0) {
@@ -1023,19 +999,15 @@ const App: React.FC = () => {
     setRegisterPending(false);
   }, [sessionKeypair, sessionFunded, boardPDA, gameId, registerPending, gameStatus, myPlayerId, maxPlayers, devnetConnection, addLog]);
 
-  // Sign moves with the session keypair and send directly to the ER — no wallet popup.
-  // Uses optimistic local board update + fire-and-forget tx for instant feel.
   const makeMove = useCallback(
     (movePosition: number) => {
       if (!sessionKeypair || !myPlayerId) return;
       if (!gameStatus?.isActive) return;
 
-      // Debounce: ignore rapid-fire presses within 120ms
       const now = Date.now();
       if (now - moveDebounceRef.current < 120) return;
       moveDebounceRef.current = now;
 
-      // --- Optimistic local board update (instant) ---
       const base = optimisticBoardRef.current
         ?? (gameStatus.board ? gameStatus.board.flat() : null);
       if (base) {
@@ -1048,8 +1020,6 @@ const App: React.FC = () => {
           const target = board[newPos];
 
           if (target === BOMB_MARK) {
-            // Match on-chain behavior immediately:
-            // hit bomb -> clear bomb tile -> warp to player's start slot (probe if occupied).
             setBombAnimKey((k) => k + 1);
             setShowBombAnim(true);
             window.setTimeout(() => setShowBombAnim(false), 1800);
@@ -1079,18 +1049,17 @@ const App: React.FC = () => {
         }
       }
 
-      // --- Fire-and-forget: build tx + send without awaiting ---
       (async () => {
         try {
           const directionVariant =
             movePosition === -boardSideLen
-              ? 0 // Up
+              ? 0
               : movePosition === boardSideLen
-                ? 1 // Down
+                ? 1
                 : movePosition === -1
-                  ? 2 // Left
+                  ? 2
                   : movePosition === 1
-                    ? 3 // Right
+                    ? 3
                     : null;
           if (directionVariant == null) {
             addLog(`Move failed: invalid direction ${movePosition}`);
@@ -1104,7 +1073,6 @@ const App: React.FC = () => {
             myPlayerId,
             directionVariant
           );
-          // Add a tiny memo payload so each move tx stays unique even with cached blockhash.
           const memoIx = new TransactionInstruction({
             programId: MEMO_PROGRAM_ID,
             keys: [],
@@ -1112,7 +1080,6 @@ const App: React.FC = () => {
           });
           const tx = new Transaction().add(ix, memoIx);
 
-          // Use cached blockhash if fresh (<30s), else fetch a new one
           let blockhash: string;
           const cached = cachedBlockhashRef.current;
           if (cached && Date.now() - cached.fetchedAt < 30_000) {
@@ -1132,7 +1099,6 @@ const App: React.FC = () => {
 
           addLog(`Moved ${moveLabel(movePosition)} (${sig.slice(0, 8)}...)`);
         } catch (e: any) {
-          // On failure, drop optimistic overlay so UI snaps back to on-chain truth.
           optimisticBoardRef.current = null;
           setOptimisticBoard(null);
           const msg = e?.message?.slice(0, 220) || "Unknown error";
@@ -1143,7 +1109,6 @@ const App: React.FC = () => {
     [sessionKeypair, myPlayerId, gameStatus?.isActive, gameStatus?.board, boardPDA, gameId, boardSize, maxPlayers, erConnection, addLog, playBumpSound, playBombSound]
   );
 
-  // Fire power in a direction via the relayer (treasury is required signer for use_power)
   const usePower = useCallback(
     (direction: number) => {
       if (!myPlayerId || !gameStatus?.isActive) return;
@@ -1152,7 +1117,6 @@ const App: React.FC = () => {
         return;
       }
 
-      // ── Beam animation: light up the scanned cells immediately ──────────────
       playLaserSound();
       const currentBoard = optimisticBoardRef.current
         ?? (gameStatus?.board ? gameStatus.board.flat() : null);
@@ -1196,13 +1160,11 @@ const App: React.FC = () => {
     [myPlayerId, myPowerupScore, gameStatus?.isActive, gameStatus?.board, gameId, boardSize, boardSideLen, maxPlayers, addLog, playLaserSound]
   );
 
-  // Keyboard controls — WASD = move, Arrow Keys = use power
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
 
-      // WASD → movement
       let move: number | null = null;
       switch (e.key) {
         case "w": case "W": move = -boardSideLen; break;
@@ -1216,7 +1178,6 @@ const App: React.FC = () => {
         return;
       }
 
-      // Arrow Keys → use power
       let powerDir: number | null = null;
       switch (e.key) {
         case "ArrowUp":    powerDir = -boardSideLen; break;
@@ -1239,7 +1200,6 @@ const App: React.FC = () => {
     return displayGame.board.flat();
   }, [displayGame?.board, optimisticBoard, boardSize]);
 
-  // Track king tile index even when a player occupies it (backend may overwrite the tile value).
   const kingTileIndexFromBoard = useMemo(() => {
     const idx = flatBoard.indexOf(KING_MARK);
     return idx >= 0 ? idx : null;
@@ -1274,7 +1234,6 @@ const App: React.FC = () => {
           Back
         </button>
       )}
-      {/* ─── Header ─── */}
       <header className="header">
         <h1 className="title">
           <span className="crown">👑</span> King Tiles
@@ -1310,7 +1269,6 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {/* ─── Fund Transfer Animation ─── */}
       {showTransferAnim && (
         <div className="transfer-overlay" aria-hidden="true">
           {COIN_X_POSITIONS.map((x, i) => (
@@ -1333,7 +1291,6 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {/* ─── Game Over Modal ─── */}
       {showGameOverModal && (() => {
         const players = endedGamePlayers.slice(0, endedGamePlayerCount);
         const sorted = [...players].sort(
@@ -1408,7 +1365,6 @@ const App: React.FC = () => {
         );
       })()}
 
-      {/* ─── Wallet & registration ─── */}
       {showLanding ? (
         <div className="landing-shell">
           <div className="landing-content">
@@ -1549,9 +1505,7 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {/* ─── Main Layout ─── */}
       <div className="main-layout">
-        {/* Left panel */}
         <div className="side-panel">
           <div className="panel-section">
             <h3>Status</h3>
@@ -1678,7 +1632,6 @@ const App: React.FC = () => {
           </div>
         </div>
 
-        {/* Grid area */}
         <div className="board-area">
           <div className="grid-wrapper">
             <div
@@ -1696,7 +1649,6 @@ const App: React.FC = () => {
                 const isBombTile = cell === BOMB_MARK;
                 const beamIdx = powerBeam ? powerBeam.indexOf(idx) : -1;
                 const isBeamCell = beamIdx >= 0;
-                // Beam hits the last cell (enemy player) — show a "hit" flash
                 const isBeamHit = isBeamCell && powerBeam != null && beamIdx === powerBeam.length - 1 && isPlayer;
 
                 if (isPlayer) {
@@ -1752,14 +1704,12 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          {/* Controls */}
           {gameStatus?.isActive && myPlayerId && (
             <div className="controls">
               <p className="controls-hint">
                 <b>WASD</b> = Move &nbsp;|&nbsp; <b>Arrow Keys</b> = Fire Power ⚡
               </p>
 
-              {/* Power bar */}
               <div className="power-bar-row">
                 <span className="power-bar-label">⚡ Power</span>
                 <div className="power-bar-track">
@@ -1775,9 +1725,7 @@ const App: React.FC = () => {
                 </span>
               </div>
 
-              {/* Dual dpad: WASD (move) + Arrow (power) */}
               <div className="dual-dpad">
-                {/* WASD dpad */}
                 <div className="dpad-group">
                   <div className="dpad-group-label">Move</div>
                   <div className="dpad">
@@ -1790,7 +1738,6 @@ const App: React.FC = () => {
                   </div>
                 </div>
 
-                {/* Arrow dpad — power fire */}
                 <div className="dpad-group">
                   <div className="dpad-group-label">Power ⚡</div>
                   <div className={`dpad ${myPowerupScore > 0 ? "dpad-powered" : "dpad-dim"}`}>
@@ -1824,7 +1771,6 @@ const App: React.FC = () => {
             </div>
           )}
 
-          {/* Fallback game-over panel visible after page refresh (no modal) */}
           {!showGameOverModal &&
             displayGame?.isActive === false &&
             (displayGame?.playersCount ?? 0) >= maxPlayers &&
@@ -1850,7 +1796,6 @@ const App: React.FC = () => {
             )}
         </div>
 
-        {/* Right panel — Info (Rules / Rewards) */}
         <div className="side-panel rules-panel">
           <div className="panel-section info-panel">
             <div className="info-tabs" role="tablist" aria-label="Game information">

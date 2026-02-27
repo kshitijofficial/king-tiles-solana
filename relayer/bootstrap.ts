@@ -35,7 +35,6 @@ export async function bootstrapRelayer(): Promise<void> {
     configuredPlayerKeypairs.map((kp) => [kp.publicKey.toBase58(), kp] as const)
   );
 
-  // Base layer (devnet) â€” built directly from env vars, no Anchor CLI dependency
   const solanaConnection = new anchor.web3.Connection(
     process.env.RPC_URL || DEFAULT_DEVNET_RPC,
     "confirmed"
@@ -46,7 +45,6 @@ export async function bootstrapRelayer(): Promise<void> {
     { commitment: "confirmed" }
   );
 
-  // Ephemeral Rollup â€” direct connection (used for VRF requests and game txs)
   const ER_ENDPOINT = process.env.ER_ENDPOINT || DEFAULT_ER_ENDPOINT;
   const ER_WS_ENDPOINT = process.env.ER_WS_ENDPOINT || DEFAULT_ER_WS_ENDPOINT;
   const connectionER = new anchor.web3.Connection(ER_ENDPOINT, {
@@ -55,10 +53,8 @@ export async function bootstrapRelayer(): Promise<void> {
   });
 
   anchor.setProvider(provider);
-  // Program ID comes from target/idl/king_tiles.json (updated on `anchor build`). No .env needed.
   let program = anchor.workspace.kingTiles as Program<KingTiles>;
 
-  // Optional: override program ID via env (e.g. point at another deployment without rebuilding)
   const programIdOverride = process.env.KING_TILES_PROGRAM_ID || process.env.PROGRAM_ID;
   if (programIdOverride) {
     const idl = JSON.parse(JSON.stringify(program.rawIdl)) as typeof program.rawIdl;
@@ -66,14 +62,12 @@ export async function bootstrapRelayer(): Promise<void> {
     program = new anchor.Program(idl, provider) as Program<KingTiles>;
   }
 
-  // ER program â€” uses direct connection to avoid router "different ER nodes" errors
   const providerER = new anchor.AnchorProvider(
     connectionER,
     new anchor.Wallet(treasuryKeypair)
   );
   const programER = new anchor.Program<KingTiles>(program.idl, providerER);
 
-  // Oracle queue for VRF on the Ephemeral Rollup
   const EPHEMERAL_ORACLE_QUEUE = new PublicKey(
     "5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc"
   );
@@ -82,7 +76,6 @@ export async function bootstrapRelayer(): Promise<void> {
   const BOMB_DROP_INTERVAL_MS = 10_000;
   const GAME_DURATION_MS = 60_000;
 
-  // â”€â”€â”€ Relayer state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   type SessionState = {
     gameId: number;
     boardPDA: PublicKey;
@@ -187,7 +180,6 @@ export async function bootstrapRelayer(): Promise<void> {
         return blockTime;
       }
     } catch {
-      // Fallback below
     }
     return Math.floor(Date.now() / 1000);
   }
@@ -203,7 +195,6 @@ export async function bootstrapRelayer(): Promise<void> {
     return expDelay + jitter;
   }
 
-  // â”€â”€â”€ Update player score on the ER (called every 1s during game) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   async function updatePlayerScore(gameId: number, boardPDA: PublicKey): Promise<void> {
     try {
       await programER.methods
@@ -214,7 +205,6 @@ export async function bootstrapRelayer(): Promise<void> {
         })
         .rpc({ skipPreflight: true, commitment: "confirmed" });
     } catch (err: any) {
-      // Suppress noisy per-tick errors; game may not have started yet or is ending
       console.error(
         `  [Score] updatePlayerScore failed for gameId ${gameId}:`,
         err.message ?? err
@@ -232,7 +222,6 @@ export async function bootstrapRelayer(): Promise<void> {
 
   function startScoreInterval(session: SessionState): void {
     console.log(`  [Score] Starting score update interval every 1s...`);
-    // Fire immediately, then every 1s
     updatePlayerScore(session.gameId, session.boardPDA);
     session.scoreInterval = setInterval(
       () => updatePlayerScore(session.gameId, session.boardPDA),
@@ -240,10 +229,9 @@ export async function bootstrapRelayer(): Promise<void> {
     );
   }
 
-  // â”€â”€â”€ Request king move randomness on the ER (called every 5s during game) â”€â”€
   async function requestKingMove(gameId: number, boardPDA: PublicKey): Promise<void> {
     try {
-      const clientSeed = Math.floor(Math.random() * 256); // random u8
+      const clientSeed = Math.floor(Math.random() * 256);
       const txHash = await programER.methods
         .requestRandomnessForKingMove(clientSeed, new anchor.BN(gameId))
         .accountsPartial({
@@ -258,10 +246,9 @@ export async function bootstrapRelayer(): Promise<void> {
     }
   }
 
-  // â”€â”€â”€ Request powerup spawn randomness on the ER (called every 5s during game) â”€â”€
   async function requestPowerupSpawn(gameId: number, boardPDA: PublicKey): Promise<void> {
     try {
-      const clientSeed = Math.floor(Math.random() * 256); // random u8
+      const clientSeed = Math.floor(Math.random() * 256);
       const txHash = await programER.methods
         .requestRandomnessForPowerupMove(clientSeed, new anchor.BN(gameId))
         .accountsPartial({
@@ -276,10 +263,9 @@ export async function bootstrapRelayer(): Promise<void> {
     }
   }
 
-  // â”€â”€â”€ Request bomb drop randomness on the ER (called every 10s during game) â”€â”€
   async function requestBombDrop(gameId: number, boardPDA: PublicKey): Promise<void> {
     try {
-      const clientSeed = Math.floor(Math.random() * 256); // random u8
+      const clientSeed = Math.floor(Math.random() * 256);
       const txHash = await programER.methods
         .requestRandomnessForBombDrop(clientSeed, new anchor.BN(gameId))
         .accountsPartial({
@@ -329,28 +315,24 @@ export async function bootstrapRelayer(): Promise<void> {
       `  [Bomb]   Starting VRF interval every ${BOMB_DROP_INTERVAL_MS / 1000}s...`
     );
 
-    // Fire king move immediately, then every 5s
     requestKingMove(session.gameId, session.boardPDA);
     session.kingMoveInterval = setInterval(
       () => requestKingMove(session.gameId, session.boardPDA),
       KING_MOVE_INTERVAL_MS
     );
 
-    // Fire powerup spawn immediately, then every 5s
     requestPowerupSpawn(session.gameId, session.boardPDA);
     session.powerupSpawnInterval = setInterval(
       () => requestPowerupSpawn(session.gameId, session.boardPDA),
       POWERUP_SPAWN_INTERVAL_MS
     );
 
-    // Fire bomb drop immediately, then every 10s
     requestBombDrop(session.gameId, session.boardPDA);
     session.bombDropInterval = setInterval(
       () => requestBombDrop(session.gameId, session.boardPDA),
       BOMB_DROP_INTERVAL_MS
     );
 
-    // Start score update ticker (every 1s)
     startScoreInterval(session);
     session.gameTimer = setTimeout(
       () => void endGameSession(session),
@@ -428,13 +410,11 @@ export async function bootstrapRelayer(): Promise<void> {
             await delegateAndStartSessionRuntime(session);
           }
         } catch {
-          // board might be moved/closed/transiently unavailable
         }
       }
     }, WATCHDOG_INTERVAL_MS);
   }
 
-  // â”€â”€â”€ End game (called after 60s timer fires) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   async function endGameSession(session: SessionState): Promise<void> {
     const { gameId, boardPDA } = session;
     if (sessionEndInFlight.has(gameId)) {
@@ -445,7 +425,6 @@ export async function bootstrapRelayer(): Promise<void> {
     stopAllIntervals(session, true);
     console.log(`\n[Timer] 60s elapsed -> ending game session for gameId: ${gameId}`);
     try {
-      // Guard against local clock skew: don't settle before chain end timestamp.
       try {
         const committedBoard = (await program.account.board.fetch(boardPDA)) as any;
         const chainNowSec = await getChainNowSec();
@@ -551,8 +530,6 @@ export async function bootstrapRelayer(): Promise<void> {
           `  [Rewards] board_account owner mismatch for gameId=${gameId}. Owner=${owner}, expected=${program.programId.toBase58()}. Retrying with exponential backoff...`
         );
 
-        // Best-effort finalize from ER: if the board is still delegated on devnet,
-        // trigger end_game_session on ER to commit+undelegate back to base layer.
         try {
           const finalizeTx = await programER.methods
             .endGameSession(new anchor.BN(gameId))
@@ -590,7 +567,6 @@ export async function bootstrapRelayer(): Promise<void> {
               );
             }
           } catch {
-            // best effort only
           }
         }
 
@@ -812,7 +788,6 @@ export async function bootstrapRelayer(): Promise<void> {
           );
         }
       } catch {
-        // best effort only
       }
       stopAllIntervals(session, true);
     } finally {
@@ -820,8 +795,6 @@ export async function bootstrapRelayer(): Promise<void> {
     }
   }
 
-  // â”€â”€â”€ Listen for GameStartedEvent on devnet â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // Uses base-layer program because register_player runs on devnet
   program.addEventListener("gameStartedEvent", async (event: any) => {
     const gameId = Number(event.gameId);
     console.log(`\n[Event] GameStartedEvent -> gameId: ${gameId}`);
@@ -834,7 +807,6 @@ export async function bootstrapRelayer(): Promise<void> {
     await delegateAndStartSessionRuntime(session);
   });
 
-  // â”€â”€â”€ Express API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const app = express();
   app.use(express.json());
   app.use((_req: Request, res: Response, next: Function) => {
@@ -844,7 +816,6 @@ export async function bootstrapRelayer(): Promise<void> {
     next();
   });
 
-  // GET / â€” health check
   app.get("/", (_req: Request, res: Response) => {
     res.json({
       ok: true,
@@ -860,7 +831,6 @@ export async function bootstrapRelayer(): Promise<void> {
     });
   });
 
-  // GET /games — list currently tracked active sessions with config
   app.get("/games", async (_req: Request, res: Response) => {
     try {
       const activeGames = await Promise.all(
@@ -874,7 +844,6 @@ export async function bootstrapRelayer(): Promise<void> {
             playersCount = Number(board?.playersCount ?? 0);
             gameEndTimestamp = Number(board?.gameEndTimestamp ?? 0);
           } catch {
-            // Keep session metadata even if fetch transiently fails.
           }
           return {
             gameId: s.gameId,
@@ -908,7 +877,6 @@ export async function bootstrapRelayer(): Promise<void> {
     }
   });
 
-  // GET /leaderboard - top players from DB read-model
   app.get("/leaderboard", async (_req: Request, res: Response) => {
     try {
       const leaderboard = await fetchTopLeaderboard(5);
@@ -924,8 +892,6 @@ export async function bootstrapRelayer(): Promise<void> {
     }
   });
 
-  // POST /start-session â€” relayer creates the board on devnet
-  // Call this first, then run the test script to register players
   app.post("/start-session", async (req: Request, res: Response) => {
     try {
       const gameId = Number(req.body?.gameId ?? 0);
@@ -971,7 +937,6 @@ export async function bootstrapRelayer(): Promise<void> {
         return;
       }
 
-      // Board for this gameId already exists â†’ init would fail with Custom 0
       try {
         await program.account.board.fetch(boardPDA);
         res.status(400).json({
@@ -980,7 +945,6 @@ export async function bootstrapRelayer(): Promise<void> {
         });
         return;
       } catch (_) {
-        // Account does not exist â€” OK to init
       }
 
       const tx = await (program.methods as any)
@@ -998,7 +962,6 @@ export async function bootstrapRelayer(): Promise<void> {
         })
         .transaction();
 
-      // startGameSession is a devnet tx â€” send via solanaConnection
       const txHash = await sendAndConfirmTransaction(solanaConnection, tx, [treasuryKeypair], {
         skipPreflight: true,
         commitment: "confirmed",
@@ -1053,7 +1016,6 @@ export async function bootstrapRelayer(): Promise<void> {
     }
   });
 
-  // GET /game-status?gameId=<n> — inspect current board state (tries ER first, falls back to devnet)
   app.get("/game-status", async (req: Request, res: Response) => {
     const requestedRaw = req.query?.gameId;
     const requestedGameId =
@@ -1077,8 +1039,6 @@ export async function bootstrapRelayer(): Promise<void> {
       return;
     }
 
-    // If this game is no longer tracked as active, prefer cached completion
-    // data and avoid hammering RPC endpoints with repeated historical reads.
     if (!sessions.has(gameId)) {
       const cachedCompleted =
         completedGames.get(gameId) ??
@@ -1175,7 +1135,6 @@ export async function bootstrapRelayer(): Promise<void> {
     }
   });
 
-  // POST /move â€” relayer submits move on ER using configured player keypair
   app.post("/move", async (req: Request, res: Response) => {
     try {
       const gameId = Number(req.body?.gameId);
@@ -1244,7 +1203,6 @@ export async function bootstrapRelayer(): Promise<void> {
     }
   });
 
-  // POST /use-power - relayer fires use_power on ER using treasury keypair (required signer)
   app.post("/use-power", async (req: Request, res: Response) => {
     try {
       const gameId = Number(req.body?.gameId);
@@ -1295,7 +1253,6 @@ export async function bootstrapRelayer(): Promise<void> {
     }
   });
 
-  // POST /retry-rewards - manually retry distribute_rewards for an ended game
   app.post("/retry-rewards", async (req: Request, res: Response) => {
     try {
       const gameId = Number(req.body?.gameId);
