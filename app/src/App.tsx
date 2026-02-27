@@ -168,6 +168,7 @@ const App: React.FC = () => {
   const kingStreakRef = useRef<Map<number, number>>(new Map());
   const kingTileIndexRef = useRef<number | null>(null);
   const lastShownGameOverGameIdRef = useRef<number | null>(null);
+  const transferAnimShownGameIdsRef = useRef<Set<number>>(new Set());
   const payoutTxTraceByGameRef = useRef<
     Map<number, Pick<TxTrace, "rewardTxHash" | "rewardTxSolscanUrl">>
   >(new Map());
@@ -461,12 +462,13 @@ const App: React.FC = () => {
     const ended = settlement;
     if (!ended) return;
     if (ended.isActive !== false) return;
-    if ((ended.gameEndTimestamp ?? 0) <= 0) return;
     const endedGameId = Number(ended.currentGameId ?? Number.NaN);
     if (!Number.isFinite(endedGameId)) return;
-    // Do not show modal for historical games after a page reload.
-    // Only recover missed transitions for games this tab has seen active.
-    if (!seenActiveGameIdsRef.current.has(endedGameId)) return;
+    const completedAtMs = Date.parse(ended.completedAtIso ?? "");
+    const isRecentCompletion =
+      Number.isFinite(completedAtMs) && Date.now() - completedAtMs <= 5 * 60_000;
+    const sawGameActiveInThisTab = seenActiveGameIdsRef.current.has(endedGameId);
+    if (!sawGameActiveInThisTab && !isRecentCompletion) return;
     if (lastShownGameOverGameIdRef.current === endedGameId) return;
 
     setEndedGamePlayers(ended.players ?? []);
@@ -477,15 +479,26 @@ const App: React.FC = () => {
 
   const closeGameOverModal = useCallback(() => {
     setShowGameOverModal(false);
-    const rewardTxSent = !!settlement?.txTrace?.rewardTxHash;
-    const hasAnyPayout = endedGamePlayers
-      .slice(0, endedGamePlayerCount)
-      .some((p) => Number(p.score) > 0);
-    if (rewardTxSent && hasAnyPayout) {
-      setShowTransferAnim(true);
-      setTimeout(() => setShowTransferAnim(false), 4500);
-    }
-  }, [settlement?.txTrace?.rewardTxHash, endedGamePlayers, endedGamePlayerCount]);
+  }, []);
+
+  useEffect(() => {
+    if (showGameOverModal) return;
+    const ended = settlement;
+    if (!ended) return;
+    const endedGameId = Number(ended.currentGameId ?? Number.NaN);
+    if (!Number.isFinite(endedGameId)) return;
+    if (transferAnimShownGameIdsRef.current.has(endedGameId)) return;
+
+    const rewardTxSent = !!ended.txTrace?.rewardTxHash;
+    const players = (ended.players ?? []).slice(0, ended.playersCount ?? 0);
+    const hasAnyPayout = players.some((p) => Number(p.score) > 0);
+    if (!rewardTxSent || !hasAnyPayout) return;
+
+    transferAnimShownGameIdsRef.current.add(endedGameId);
+    setShowTransferAnim(true);
+    const timer = setTimeout(() => setShowTransferAnim(false), 4500);
+    return () => clearTimeout(timer);
+  }, [settlement, showGameOverModal]);
 
   // Move SFX: play a short sound each time any player position changes.
   useEffect(() => {
