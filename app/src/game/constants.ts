@@ -4,7 +4,7 @@ import { PublicKey } from "@solana/web3.js";
 export const PROGRAM_ID = new PublicKey(
   typeof process !== "undefined" && process.env?.REACT_APP_PROGRAM_ID
     ? process.env.REACT_APP_PROGRAM_ID
-    : "AN5cqzkh1fMg631UP9NcwDCaDBu1idTyJqcDqyYA9g5M"
+    : "GAfcEqSSQJm2coiTRf4wL1SDX78jciwE6bN9eHwUaXi9"
 );
 
 export const TREASURY_PUBKEY = new PublicKey(
@@ -25,9 +25,9 @@ export const MEMO_PROGRAM_ID = new PublicKey(
 );
 
 export const EMPTY = 0;
-export const KING_MARK = 5;
-export const POWERUP_MARK = 6;
-export const BOMB_MARK = 7;
+export const KING_MARK = 255;
+export const POWERUP_MARK = 254;
+export const BOMB_MARK = 253;
 
 export const REGISTRATION_FEE_LAMPORTS = 1_000_000; // 0.001 SOL
 
@@ -36,8 +36,15 @@ export const REGISTER_PLAYER_DISCRIMINATOR = [
   242, 146, 194, 234, 234, 145, 228, 42,
 ];
 
-export const PLAYER_COLORS = ["#4FC3F7", "#EF5350", "#66BB6A", "#FFA726"];
-export const PLAYER_LABELS = ["P1", "P2", "P3", "P4"];
+export const PLAYER_COLORS = [
+  "#4FC3F7",
+  "#EF5350",
+  "#66BB6A",
+  "#FFA726",
+  "#AB47BC",
+  "#26A69A",
+];
+export const PLAYER_LABELS = ["P1", "P2", "P3", "P4", "P5", "P6"];
 
 // Pre-computed positions so Math.random() isn't called on every render
 export const COIN_X_POSITIONS = Array.from({ length: 15 }, (_, i) =>

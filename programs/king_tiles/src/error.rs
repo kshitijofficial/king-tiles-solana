@@ -3,7 +3,7 @@ use anchor_lang::prelude::*;
 #[error_code]
 /// Program-specific errors returned by instruction handlers.
 pub enum KingTilesError {
-    #[msg("Maximum players (2) already registered for this game")]
+    #[msg("Maximum players already registered for this game")]
     MaxPlayersReached,
 
     #[msg("Game has already started; no more registrations allowed")]
@@ -35,4 +35,7 @@ pub enum KingTilesError {
 
     #[msg("Invalid powerup move")]
     InvalidPowerupMove,
+
+    #[msg("Invalid game configuration")]
+    InvalidGameConfig,
 }

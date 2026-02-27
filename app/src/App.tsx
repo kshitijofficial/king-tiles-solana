@@ -18,7 +18,6 @@ import { useBumpSound } from "./audio/useBumpSound";
 import { useLaserSound } from "./audio/useLaserSound";
 import { useBombSound } from "./audio/useBombSound";
 import {
-  BOARD_SIZE,
   BOMB_MARK,
   COLS,
   COIN_X_POSITIONS,
@@ -36,23 +35,73 @@ import {
 import { buildMakeMoveIx, buildRegisterPlayerIx } from "./game/instructions";
 import { getBoardPDA } from "./game/pda";
 import { getWinningPlayerId } from "./game/winner";
-import { CompletedGameSnapshot, GameStatus, PlayerInfo } from "./game/types";
+import { CompletedGameSnapshot, GameStatus, PlayerInfo, TxTrace } from "./game/types";
 import { formatTime, moveLabel } from "./utils/format";
+
+type GameMode = {
+  label: string;
+  boardSideLen: number;
+  maxPlayers: number;
+  registrationFeeLamports: number;
+  lamportsPerScore: number;
+};
+
+type ActiveGameSummary = {
+  gameId: number;
+  boardSideLen: number;
+  maxPlayers: number;
+  registrationFeeLamports: number;
+  lamportsPerScore: number;
+  isActive?: boolean;
+  playersCount?: number;
+  gameEndTimestamp?: number;
+};
+
+const GAME_MODES: GameMode[] = [
+  {
+    label: "8x8 - 2 Players",
+    boardSideLen: 8,
+    maxPlayers: 2,
+    registrationFeeLamports: 1_000_000,
+    lamportsPerScore: 29_000,
+  },
+  {
+    label: "10x10 - 4 Players",
+    boardSideLen: 10,
+    maxPlayers: 4,
+    registrationFeeLamports: 1_500_000,
+    lamportsPerScore: 22_000,
+  },
+  {
+    label: "12x12 - 6 Players",
+    boardSideLen: 12,
+    maxPlayers: 6,
+    registrationFeeLamports: 2_000_000,
+    lamportsPerScore: 18_000,
+  },
+];
 
 // Returns the board cell indices the power beam travels through, starting from
 // fromPos stepping by direction until it hits a board edge (or a player).
-function getBeamCells(fromPos: number, direction: number, board: number[]): number[] {
+function getBeamCells(
+  fromPos: number,
+  direction: number,
+  board: number[],
+  boardSize: number,
+  cols: number,
+  maxPlayers: number
+): number[] {
   const cells: number[] = [];
   let pos = fromPos;
-  for (let step = 0; step < BOARD_SIZE; step++) {
+  for (let step = 0; step < boardSize; step++) {
     pos += direction;
-    if (pos < 0 || pos >= BOARD_SIZE) break;
+    if (pos < 0 || pos >= boardSize) break;
     // Horizontal moves (±1) must stay on the same row
-    if (Math.abs(direction) === 1 && Math.floor(pos / COLS) !== Math.floor(fromPos / COLS)) break;
+    if (Math.abs(direction) === 1 && Math.floor(pos / cols) !== Math.floor(fromPos / cols)) break;
     cells.push(pos);
     // Beam stops at the first enemy player cell (it's the target)
     const cell = board[pos];
-    if (cell >= 1 && cell <= 4 && cell !== board[fromPos]) break;
+    if (cell >= 1 && cell <= maxPlayers && cell !== board[fromPos]) break;
   }
   return cells;
 }
@@ -96,6 +145,11 @@ const App: React.FC = () => {
   const [bombAnimKey, setBombAnimKey] = useState(0);
   const [powerBeam, setPowerBeam] = useState<number[] | null>(null);
   const [showLanding, setShowLanding] = useState(true);
+  const [selectedMode, setSelectedMode] = useState<GameMode | null>(null);
+  const [selectedGameId, setSelectedGameId] = useState<number | null>(null);
+  const [activeGames, setActiveGames] = useState<ActiveGameSummary[]>([]);
+  const [lastCompletedFromGames, setLastCompletedFromGames] =
+    useState<CompletedGameSnapshot | null>(null);
   const [leaderboard, setLeaderboard] = useState<LeaderboardRow[]>([]);
   const [leaderboardLoading, setLeaderboardLoading] = useState(true);
   const [leaderboardError, setLeaderboardError] = useState<string | null>(null);
@@ -110,8 +164,14 @@ const App: React.FC = () => {
   const prevPowerupScoresRef = useRef<Map<number, number> | null>(null);
   const prevPowerupScoresForLaserRef = useRef<Map<number, number> | null>(null);
   const prevFlatBoardRef = useRef<number[] | null>(null);
+  const seenActiveGameIdsRef = useRef<Set<number>>(new Set());
   const kingStreakRef = useRef<Map<number, number>>(new Map());
   const kingTileIndexRef = useRef<number | null>(null);
+  const lastShownGameOverGameIdRef = useRef<number | null>(null);
+  const transferAnimShownGameIdsRef = useRef<Set<number>>(new Set());
+  const payoutTxTraceByGameRef = useRef<
+    Map<number, Pick<TxTrace, "rewardTxHash" | "rewardTxSolscanUrl">>
+  >(new Map());
 
   // Optimistic move system: cached blockhash + local board overlay
   const cachedBlockhashRef = useRef<{ blockhash: string; fetchedAt: number } | null>(null);
@@ -129,10 +189,74 @@ const App: React.FC = () => {
   const { playBombSound } = useBombSound(0.17);
 
   const displayGame = useMemo<CompletedGameSnapshot | GameStatus | null>(() => {
-    if (!gameStatus) return null;
-    if (gameStatus.currentGameId !== null) return gameStatus;
-    return gameStatus.lastCompletedGame ?? null;
-  }, [gameStatus]);
+    if (gameStatus?.currentGameId !== null) return gameStatus;
+    if (gameStatus?.lastCompletedGame) return gameStatus.lastCompletedGame;
+    return lastCompletedFromGames ?? null;
+  }, [gameStatus, lastCompletedFromGames]);
+
+  useEffect(() => {
+    const snapshots = [gameStatus?.lastCompletedGame, lastCompletedFromGames];
+    for (const snapshot of snapshots) {
+      if (!snapshot) continue;
+      const gameId = Number(snapshot.currentGameId);
+      if (!Number.isFinite(gameId)) continue;
+      const rewardTxHash = snapshot.txTrace?.rewardTxHash;
+      const rewardTxSolscanUrl = snapshot.txTrace?.rewardTxSolscanUrl;
+      if (!rewardTxHash && !rewardTxSolscanUrl) continue;
+      const existing = payoutTxTraceByGameRef.current.get(gameId);
+      payoutTxTraceByGameRef.current.set(gameId, {
+        rewardTxHash: rewardTxHash ?? existing?.rewardTxHash,
+        rewardTxSolscanUrl: rewardTxSolscanUrl ?? existing?.rewardTxSolscanUrl,
+      });
+    }
+  }, [gameStatus?.lastCompletedGame, lastCompletedFromGames]);
+
+  const settlementTargetGameId = useMemo<number | null>(() => {
+    const activeGameId = Number(gameStatus?.currentGameId ?? Number.NaN);
+    if (Number.isFinite(activeGameId)) return activeGameId;
+    const selectedId = Number(selectedGameId ?? Number.NaN);
+    if (Number.isFinite(selectedId)) return selectedId;
+    return null;
+  }, [gameStatus?.currentGameId, selectedGameId]);
+
+  const settlement = useMemo<CompletedGameSnapshot | null>(() => {
+    const candidates = [gameStatus?.lastCompletedGame, lastCompletedFromGames].filter(
+      (snapshot): snapshot is CompletedGameSnapshot => !!snapshot
+    );
+    if (!candidates.length) return null;
+    if (!Number.isFinite(settlementTargetGameId ?? Number.NaN)) return null;
+
+    const sameGameSnapshots = candidates.filter(
+      (snapshot) => Number(snapshot.currentGameId) === Number(settlementTargetGameId)
+    );
+    if (!sameGameSnapshots.length) return null;
+
+    const sortedByTime = [...sameGameSnapshots].sort((a, b) => {
+      const aTs = Date.parse(a.completedAtIso ?? "");
+      const bTs = Date.parse(b.completedAtIso ?? "");
+      return (Number.isFinite(bTs) ? bTs : 0) - (Number.isFinite(aTs) ? aTs : 0);
+    });
+    const latest = sortedByTime[0];
+    const mergedTxTrace = sameGameSnapshots.reduce<TxTrace>(
+      (acc, snapshot) => ({ ...acc, ...snapshot.txTrace }),
+      {}
+    );
+
+    const stickyTx = payoutTxTraceByGameRef.current.get(Number(settlementTargetGameId));
+    const rewardTxHash = mergedTxTrace.rewardTxHash ?? stickyTx?.rewardTxHash;
+    const rewardTxSolscanUrl = mergedTxTrace.rewardTxSolscanUrl ?? stickyTx?.rewardTxSolscanUrl;
+
+    return {
+      ...latest,
+      txTrace: {
+        ...mergedTxTrace,
+        rewardTxHash,
+        rewardTxSolscanUrl,
+        rewardError:
+          rewardTxHash || rewardTxSolscanUrl ? undefined : mergedTxTrace.rewardError,
+      },
+    };
+  }, [gameStatus?.lastCompletedGame, lastCompletedFromGames, settlementTargetGameId]);
 
   const myPlayerId = useMemo(() => {
     if (!sessionKeypair || !displayGame?.players) return null;
@@ -153,11 +277,42 @@ const App: React.FC = () => {
     return p ? Number(p.powerupScore ?? 0) : 0;
   }, [myPlayerId, displayGame?.players]);
 
+  const boardSideLen = useMemo(() => {
+    const fromDisplay = Number(displayGame?.boardSideLen ?? 0);
+    if (fromDisplay > 0) return fromDisplay;
+    return selectedMode?.boardSideLen ?? COLS;
+  }, [displayGame?.boardSideLen, selectedMode]);
+
+  const boardSize = useMemo(() => boardSideLen * boardSideLen, [boardSideLen]);
+
+  const maxPlayers = useMemo(() => {
+    const fromDisplay = Number(displayGame?.maxPlayers ?? 0);
+    if (fromDisplay > 0) return fromDisplay;
+    return selectedMode?.maxPlayers ?? 2;
+  }, [displayGame?.maxPlayers, selectedMode]);
+
+  const registrationFeeLamports = useMemo(() => {
+    const fromDisplay = Number(displayGame?.registrationFeeLamports ?? 0);
+    if (fromDisplay > 0) return fromDisplay;
+    return selectedMode?.registrationFeeLamports ?? REGISTRATION_FEE_LAMPORTS;
+  }, [displayGame?.registrationFeeLamports, selectedMode]);
+
+  const backToLanding = useCallback(() => {
+    setShowLanding(true);
+    setSelectedMode(null);
+    setSelectedGameId(null);
+    setGameStatus(null);
+    setError(null);
+    optimisticBoardRef.current = null;
+    setOptimisticBoard(null);
+    setPowerBeam(null);
+  }, []);
+
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [`${new Date().toLocaleTimeString()} ${msg}`, ...prev].slice(0, 30));
   }, []);
 
-  // Fund session keypair on devnet so it can pay registration fees and sign moves
+  // Fund session keypair from wallet so it can pay registration fees and sign moves
   useEffect(() => {
     if (!sessionKeypair) {
       setSessionFunded(false);
@@ -174,38 +329,24 @@ const App: React.FC = () => {
           }
           return;
         }
-        addLog("Funding session key via airdrop...");
-        const sig = await devnetConnection.requestAirdrop(
-          sessionKeypair.publicKey,
-          LAMPORTS_PER_SOL
+        if (!publicKey || !sendTransaction) return;
+        addLog("Funding session key via wallet transfer...");
+        const tx = new Transaction().add(
+          SystemProgram.transfer({
+            fromPubkey: publicKey,
+            toPubkey: sessionKeypair.publicKey,
+            lamports: Math.round(0.01 * LAMPORTS_PER_SOL),
+          })
         );
+        const sig = await sendTransaction(tx, devnetConnection);
         await devnetConnection.confirmTransaction(sig, "confirmed");
         if (!cancelled) {
           setSessionFunded(true);
-          addLog("Session key funded.");
+          addLog("Session key funded via wallet.");
         }
-      } catch {
-        if (cancelled) return;
-        addLog("Airdrop failed, funding via wallet transfer...");
-        try {
-          if (!publicKey || !sendTransaction) return;
-          const tx = new Transaction().add(
-            SystemProgram.transfer({
-              fromPubkey: publicKey,
-              toPubkey: sessionKeypair.publicKey,
-              lamports: Math.round(0.01 * LAMPORTS_PER_SOL),
-            })
-          );
-          const sig2 = await sendTransaction(tx, devnetConnection);
-          await devnetConnection.confirmTransaction(sig2, "confirmed");
-          if (!cancelled) {
-            setSessionFunded(true);
-            addLog("Session key funded via wallet.");
-          }
-        } catch (e2: any) {
-          if (!cancelled)
-            addLog("Failed to fund session key: " + (e2?.message?.slice(0, 60) || ""));
-        }
+      } catch (e: any) {
+        if (!cancelled)
+          addLog("Failed to fund session key: " + (e?.message?.slice(0, 60) || ""));
       }
     })();
     return () => { cancelled = true; };
@@ -286,6 +427,13 @@ const App: React.FC = () => {
     const isActive = displayGame?.isActive;
     if (isActive === undefined || isActive === null) return;
 
+    if (isActive === true) {
+      const activeGameId = Number(displayGame?.currentGameId ?? Number.NaN);
+      if (Number.isFinite(activeGameId)) {
+        seenActiveGameIdsRef.current.add(activeGameId);
+      }
+    }
+
     if (prevIsActiveRef.current === true && isActive === false) {
       if (kingNotifTimerRef.current) {
         clearTimeout(kingNotifTimerRef.current);
@@ -299,22 +447,58 @@ const App: React.FC = () => {
       setShowPowerupAcquired(false);
       setEndedGamePlayers(displayGame?.players ?? []);
       setEndedGamePlayerCount(displayGame?.playersCount ?? 0);
+      const endedGameId = Number(displayGame?.currentGameId ?? Number.NaN);
+      if (Number.isFinite(endedGameId)) {
+        lastShownGameOverGameIdRef.current = endedGameId;
+      }
       setShowGameOverModal(true);
     }
     prevIsActiveRef.current = isActive;
   }, [displayGame]);
 
+  // Fallback: if transition was missed (refresh/poll race), show game-over modal once for ended settlement.
+  useEffect(() => {
+    if (showGameOverModal) return;
+    const ended = settlement;
+    if (!ended) return;
+    if (ended.isActive !== false) return;
+    const endedGameId = Number(ended.currentGameId ?? Number.NaN);
+    if (!Number.isFinite(endedGameId)) return;
+    const completedAtMs = Date.parse(ended.completedAtIso ?? "");
+    const isRecentCompletion =
+      Number.isFinite(completedAtMs) && Date.now() - completedAtMs <= 5 * 60_000;
+    const sawGameActiveInThisTab = seenActiveGameIdsRef.current.has(endedGameId);
+    if (!sawGameActiveInThisTab && !isRecentCompletion) return;
+    if (lastShownGameOverGameIdRef.current === endedGameId) return;
+
+    setEndedGamePlayers(ended.players ?? []);
+    setEndedGamePlayerCount(ended.playersCount ?? 0);
+    lastShownGameOverGameIdRef.current = endedGameId;
+    setShowGameOverModal(true);
+  }, [settlement, showGameOverModal]);
+
   const closeGameOverModal = useCallback(() => {
     setShowGameOverModal(false);
-    const rewardTxSent = !!gameStatus?.lastCompletedGame?.txTrace?.rewardTxHash;
-    const hasAnyPayout = endedGamePlayers
-      .slice(0, endedGamePlayerCount)
-      .some((p) => Number(p.score) > 0);
-    if (rewardTxSent && hasAnyPayout) {
-      setShowTransferAnim(true);
-      setTimeout(() => setShowTransferAnim(false), 4500);
-    }
-  }, [gameStatus?.lastCompletedGame?.txTrace?.rewardTxHash, endedGamePlayers, endedGamePlayerCount]);
+  }, []);
+
+  useEffect(() => {
+    if (showGameOverModal) return;
+    const ended = settlement;
+    if (!ended) return;
+    const endedGameId = Number(ended.currentGameId ?? Number.NaN);
+    if (!Number.isFinite(endedGameId)) return;
+    if (transferAnimShownGameIdsRef.current.has(endedGameId)) return;
+
+    const rewardTxSent = !!ended.txTrace?.rewardTxHash;
+    const players = (ended.players ?? []).slice(0, ended.playersCount ?? 0);
+    const hasAnyPayout = players.some((p) => Number(p.score) > 0);
+    if (!rewardTxSent || !hasAnyPayout) return;
+
+    transferAnimShownGameIdsRef.current.add(endedGameId);
+    setShowTransferAnim(true);
+    const timer = setTimeout(() => setShowTransferAnim(false), 4500);
+    return () => clearTimeout(timer);
+  }, [settlement, showGameOverModal]);
 
   // Move SFX: play a short sound each time any player position changes.
   useEffect(() => {
@@ -512,9 +696,75 @@ const App: React.FC = () => {
     };
   }, []);
 
-  const refetchGameStatus = useCallback(async () => {
+  const findModeGames = useCallback(
+    (mode: GameMode, games: ActiveGameSummary[]) =>
+      games
+        .filter(
+          (g) =>
+            Number(g.boardSideLen) === mode.boardSideLen &&
+            Number(g.maxPlayers) === mode.maxPlayers
+        )
+        .sort((a, b) => {
+          const activeA = a.isActive ? 1 : 0;
+          const activeB = b.isActive ? 1 : 0;
+          if (activeA !== activeB) return activeB - activeA;
+          return Number(b.gameId) - Number(a.gameId);
+        }),
+    []
+  );
+
+  const fetchGamesOverview = useCallback(async (): Promise<ActiveGameSummary[]> => {
     try {
-      const res = await fetch(`${RELAYER_URL}/game-status`);
+      const res = await fetch(`${RELAYER_URL}/games`);
+      const data = await res.json();
+      if (!res.ok || data?.ok === false) return [];
+      const games: ActiveGameSummary[] = Array.isArray(data?.activeGames)
+        ? data.activeGames
+        : [];
+      setActiveGames(games);
+      setLastCompletedFromGames((data?.lastCompletedGame as CompletedGameSnapshot) ?? null);
+      return games;
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const resolveGameIdForMode = useCallback(
+    async (mode: GameMode): Promise<number | null> => {
+      const localMatches = findModeGames(mode, activeGames);
+      if (localMatches.length > 0) {
+        return Number(localMatches[0].gameId);
+      }
+      try {
+        const res = await fetch(`${RELAYER_URL}/games`);
+        const data = await res.json();
+        if (!res.ok || data?.ok === false) return null;
+        const activeGames: ActiveGameSummary[] = Array.isArray(data?.activeGames)
+          ? data.activeGames
+          : [];
+        setActiveGames(activeGames);
+        setLastCompletedFromGames((data?.lastCompletedGame as CompletedGameSnapshot) ?? null);
+        const matches = findModeGames(mode, activeGames);
+        return matches.length > 0 ? Number(matches[0].gameId) : null;
+      } catch {
+        return null;
+      }
+    },
+    [activeGames, findModeGames]
+  );
+
+  const refetchGameStatus = useCallback(async () => {
+    if (!selectedMode) return;
+    const resolvedGameId = await resolveGameIdForMode(selectedMode);
+    const gameIdToQuery = resolvedGameId ?? selectedGameId;
+    if (gameIdToQuery == null) {
+      setGameStatus(null);
+      setError(`No active ${selectedMode.label} game right now.`);
+      return;
+    }
+    if (selectedGameId !== gameIdToQuery) setSelectedGameId(gameIdToQuery);
+    try {
+      const res = await fetch(`${RELAYER_URL}/game-status?gameId=${gameIdToQuery}`);
       const data: GameStatus & { error?: string } = await res.json();
       if (res.ok && data.ok !== false) {
         setGameStatus(data);
@@ -525,7 +775,7 @@ const App: React.FC = () => {
     } catch {
       setError("Cannot reach relayer at " + RELAYER_URL);
     }
-  }, []);
+  }, [resolveGameIdForMode, selectedGameId, selectedMode]);
 
   const fetchLeaderboard = useCallback(async () => {
     try {
@@ -546,30 +796,56 @@ const App: React.FC = () => {
 
   // Poll relayer /game-status (only update board when we get ok response; keep last good state on 503)
   useEffect(() => {
+    if (!selectedMode) return;
     let active = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let lastKnownIsActive: boolean | undefined = undefined;
+    const scheduleNextPoll = (hadError: boolean) => {
+      const baseDelayMs = lastKnownIsActive ? 1_000 : 2_500;
+      const delayMs = hadError ? Math.min(baseDelayMs * 2, 8_000) : baseDelayMs;
+      timer = setTimeout(() => {
+        void poll();
+      }, delayMs);
+    };
     const poll = async () => {
+      let hadError = false;
       try {
-        const res = await fetch(`${RELAYER_URL}/game-status`);
+        const resolvedGameId = await resolveGameIdForMode(selectedMode);
+        const gameIdToQuery = resolvedGameId ?? selectedGameId;
+        if (gameIdToQuery == null) {
+          if (active) {
+            setGameStatus(null);
+            setError(`No active ${selectedMode.label} game right now.`);
+          }
+          lastKnownIsActive = false;
+          if (active) scheduleNextPoll(false);
+          return;
+        }
+        if (active && selectedGameId !== gameIdToQuery) setSelectedGameId(gameIdToQuery);
+        const res = await fetch(`${RELAYER_URL}/game-status?gameId=${gameIdToQuery}`);
         const data: GameStatus & { error?: string } = await res.json();
         if (active) {
           if (res.ok && data.ok !== false) {
             setGameStatus(data);
             setError(null);
+            lastKnownIsActive = !!data.isActive;
           } else {
+            hadError = true;
             setError(data.error ?? "Game status unavailable");
           }
         }
       } catch {
+        hadError = true;
         if (active) setError("Cannot reach relayer at " + RELAYER_URL);
       }
+      if (active) scheduleNextPoll(hadError);
     };
-    poll();
-    const id = setInterval(poll, 1000);
+    void poll();
     return () => {
       active = false;
-      clearInterval(id);
+      if (timer) clearTimeout(timer);
     };
-  }, []);
+  }, [resolveGameIdForMode, selectedGameId, selectedMode]);
 
   useEffect(() => {
     let active = true;
@@ -584,6 +860,20 @@ const App: React.FC = () => {
       clearInterval(id);
     };
   }, [fetchLeaderboard]);
+
+  useEffect(() => {
+    let active = true;
+    const pollGames = async () => {
+      if (!active) return;
+      await fetchGamesOverview();
+    };
+    pollGames();
+    const id = setInterval(pollGames, 5_000);
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
+  }, [fetchGamesOverview]);
 
   // Countdown timer
   useEffect(() => {
@@ -611,7 +901,7 @@ const App: React.FC = () => {
     }
   }, [countdown, gameStatus?.isActive, playEmergencyTick]);
 
-  const gameId = gameStatus?.currentGameId ?? GAME_ID;
+  const gameId = gameStatus?.currentGameId ?? selectedGameId ?? GAME_ID;
   const boardPDA = useMemo(() => getBoardPDA(gameId), [gameId]);
 
   const registerForGame = useCallback(async () => {
@@ -628,7 +918,7 @@ const App: React.FC = () => {
       addLog("You are already registered.");
       return;
     }
-    if ((gameStatus?.playersCount ?? 0) >= 2) {
+    if ((gameStatus?.playersCount ?? 0) >= maxPlayers) {
       addLog("Game is full.");
       return;
     }
@@ -649,7 +939,7 @@ const App: React.FC = () => {
       addLog(`Register failed: ${msg}`);
     }
     setRegisterPending(false);
-  }, [sessionKeypair, sessionFunded, boardPDA, gameId, registerPending, gameStatus, myPlayerId, devnetConnection, addLog]);
+  }, [sessionKeypair, sessionFunded, boardPDA, gameId, registerPending, gameStatus, myPlayerId, maxPlayers, devnetConnection, addLog]);
 
   // Sign moves with the session keypair and send directly to the ER — no wallet popup.
   // Uses optimistic local board update + fire-and-forget tx for instant feel.
@@ -672,7 +962,7 @@ const App: React.FC = () => {
         const currentPos = board.indexOf(myPlayerId);
         if (currentPos >= 0) {
           const raw = currentPos + movePosition;
-          const newPos = ((raw % BOARD_SIZE) + BOARD_SIZE) % BOARD_SIZE;
+          const newPos = ((raw % boardSize) + boardSize) % boardSize;
           const target = board[newPos];
 
           if (target === BOMB_MARK) {
@@ -685,17 +975,17 @@ const App: React.FC = () => {
             board[currentPos] = EMPTY;
             board[newPos] = EMPTY;
             let landing = Math.max(0, myPlayerId - 1);
-            for (let i = 0; i < BOARD_SIZE; i += 1) {
+            for (let i = 0; i < boardSize; i += 1) {
               if (board[landing] === EMPTY) break;
-              landing = (landing + 1) % BOARD_SIZE;
+              landing = (landing + 1) % boardSize;
             }
             board[landing] = myPlayerId;
             addLog("💣 Bomb hit! Warped to start.");
           } else if (target === EMPTY || target === KING_MARK || target === POWERUP_MARK) {
             board[currentPos] = EMPTY;
             board[newPos] = myPlayerId;
-          } else if (target >= 1 && target <= 4 && target !== myPlayerId) {
-            const pushPos = ((newPos + movePosition + movePosition) % BOARD_SIZE + BOARD_SIZE) % BOARD_SIZE;
+          } else if (target >= 1 && target <= maxPlayers && target !== myPlayerId) {
+            const pushPos = ((newPos + movePosition + movePosition) % boardSize + boardSize) % boardSize;
             board[pushPos] = target;
             board[currentPos] = EMPTY;
             board[newPos] = myPlayerId;
@@ -710,12 +1000,27 @@ const App: React.FC = () => {
       // --- Fire-and-forget: build tx + send without awaiting ---
       (async () => {
         try {
+          const directionVariant =
+            movePosition === -boardSideLen
+              ? 0 // Up
+              : movePosition === boardSideLen
+                ? 1 // Down
+                : movePosition === -1
+                  ? 2 // Left
+                  : movePosition === 1
+                    ? 3 // Right
+                    : null;
+          if (directionVariant == null) {
+            addLog(`Move failed: invalid direction ${movePosition}`);
+            return;
+          }
+
           const ix = buildMakeMoveIx(
             sessionKeypair.publicKey,
             boardPDA,
             gameId,
             myPlayerId,
-            movePosition
+            directionVariant
           );
           // Add a tiny memo payload so each move tx stays unique even with cached blockhash.
           const memoIx = new TransactionInstruction({
@@ -753,7 +1058,7 @@ const App: React.FC = () => {
         }
       })();
     },
-    [sessionKeypair, myPlayerId, gameStatus?.isActive, gameStatus?.board, boardPDA, gameId, erConnection, addLog, playBumpSound, playBombSound]
+    [sessionKeypair, myPlayerId, gameStatus?.isActive, gameStatus?.board, boardPDA, gameId, boardSize, maxPlayers, erConnection, addLog, playBumpSound, playBombSound]
   );
 
   // Fire power in a direction via the relayer (treasury is required signer for use_power)
@@ -772,7 +1077,14 @@ const App: React.FC = () => {
       if (currentBoard) {
         const myPos = currentBoard.indexOf(myPlayerId);
         if (myPos >= 0) {
-          const beam = getBeamCells(myPos, direction, currentBoard);
+          const beam = getBeamCells(
+            myPos,
+            direction,
+            currentBoard,
+            boardSize,
+            boardSideLen,
+            maxPlayers
+          );
           if (beam.length > 0) {
             if (powerBeamTimerRef.current) clearTimeout(powerBeamTimerRef.current);
             setPowerBeam(beam);
@@ -799,7 +1111,7 @@ const App: React.FC = () => {
         }
       })();
     },
-    [myPlayerId, myPowerupScore, gameStatus?.isActive, gameStatus?.board, gameId, addLog, playLaserSound]
+    [myPlayerId, myPowerupScore, gameStatus?.isActive, gameStatus?.board, gameId, boardSize, boardSideLen, maxPlayers, addLog, playLaserSound]
   );
 
   // Keyboard controls — WASD = move, Arrow Keys = use power
@@ -811,8 +1123,8 @@ const App: React.FC = () => {
       // WASD → movement
       let move: number | null = null;
       switch (e.key) {
-        case "w": case "W": move = -12; break;
-        case "s": case "S": move = 12; break;
+        case "w": case "W": move = -boardSideLen; break;
+        case "s": case "S": move = boardSideLen; break;
         case "a": case "A": move = -1; break;
         case "d": case "D": move = 1; break;
       }
@@ -825,8 +1137,8 @@ const App: React.FC = () => {
       // Arrow Keys → use power
       let powerDir: number | null = null;
       switch (e.key) {
-        case "ArrowUp":    powerDir = -12; break;
-        case "ArrowDown":  powerDir = 12; break;
+        case "ArrowUp":    powerDir = -boardSideLen; break;
+        case "ArrowDown":  powerDir = boardSideLen; break;
         case "ArrowLeft":  powerDir = -1; break;
         case "ArrowRight": powerDir = 1; break;
       }
@@ -837,13 +1149,13 @@ const App: React.FC = () => {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [makeMove, usePower]);
+  }, [boardSideLen, makeMove, usePower]);
 
   const flatBoard = useMemo(() => {
     if (optimisticBoard) return optimisticBoard;
-    if (!displayGame?.board) return new Array(BOARD_SIZE).fill(0);
+    if (!displayGame?.board) return new Array(boardSize).fill(0);
     return displayGame.board.flat();
-  }, [displayGame?.board, optimisticBoard]);
+  }, [displayGame?.board, optimisticBoard, boardSize]);
 
   // Track king tile index even when a player occupies it (backend may overwrite the tile value).
   const kingTileIndexFromBoard = useMemo(() => {
@@ -862,7 +1174,7 @@ const App: React.FC = () => {
   const statusText = displayGame?.isActive
     ? "ACTIVE"
     : gameStatus?.currentGameId !== null
-    ? `Waiting (${displayGame?.playersCount ?? 0}/2 players)`
+    ? `Waiting (${displayGame?.playersCount ?? 0}/${maxPlayers} players)`
     : displayGame
     ? `Completed (Game ${displayGame.currentGameId})`
     : "No game";
@@ -875,6 +1187,11 @@ const App: React.FC = () => {
   return (
     <div className="app">
       <BackgroundMusic />
+      {!showLanding && (
+        <button type="button" className="btn-back btn-back-corner" onClick={backToLanding}>
+          Back
+        </button>
+      )}
       {/* ─── Header ─── */}
       <header className="header">
         <h1 className="title">
@@ -945,7 +1262,7 @@ const App: React.FC = () => {
           ? sorted.find((p) => p.id === winnerId) ?? null
           : null;
         const isMyWin = winnerId != null && myPlayerId === winnerId;
-        const payoutTxSent = !!gameStatus?.lastCompletedGame?.txTrace?.rewardTxHash;
+        const payoutTxSent = !!settlement?.txTrace?.rewardTxHash;
         const hasAnyPayout = players.some((p) => Number(p.score) > 0);
         return (
           <div
@@ -966,7 +1283,7 @@ const App: React.FC = () => {
                 >
                   {isMyWin
                     ? "🎉 You Win! Congrats!"
-                    : `👑 ${PLAYER_LABELS[winner.id - 1]} Wins!`}
+                    : `👑 ${PLAYER_LABELS[winner.id - 1] ?? `P${winner.id}`} Wins!`}
                 </div>
               )}
               {!winner && (
@@ -991,8 +1308,8 @@ const App: React.FC = () => {
                     <span className="final-rank">
                       {i === 0 ? "🥇" : i === 1 ? "🥈" : "🥉"}
                     </span>
-                    <span style={{ color: PLAYER_COLORS[p.id - 1] }}>
-                      {PLAYER_LABELS[p.id - 1]}
+                    <span style={{ color: PLAYER_COLORS[(p.id - 1) % PLAYER_COLORS.length] }}>
+                      {PLAYER_LABELS[p.id - 1] ?? `P${p.id}`}
                     </span>
                     <span className="final-score-modal">{p.score} pts</span>
                   </div>
@@ -1017,17 +1334,74 @@ const App: React.FC = () => {
             <p className="landing-subtitle">
               Join King Tiles, hold the king tile, and earn on-chain rewards.
             </p>
-            <button
-              type="button"
-              className="landing-start-btn"
-              onClick={() => setShowLanding(false)}
-            >
-              Start Game
-            </button>
+            <div className="mode-select-box">
+              <div className="mode-select-title">Choose Your Arena</div>
+              <div className="mode-select-grid">
+                {GAME_MODES.map((mode) => (
+                  (() => {
+                    const modeGames = findModeGames(mode, activeGames);
+                    const currentGame = modeGames.length > 0 ? modeGames[0] : null;
+                    const endedForMode =
+                      lastCompletedFromGames &&
+                      Number(lastCompletedFromGames.boardSideLen) === mode.boardSideLen &&
+                      Number(lastCompletedFromGames.maxPlayers) === mode.maxPlayers
+                        ? lastCompletedFromGames
+                        : null;
+
+                    const gameIdLabel = currentGame
+                      ? String(currentGame.gameId)
+                      : endedForMode
+                        ? String(endedForMode.currentGameId)
+                        : "-";
+
+                    const statusLabel = currentGame
+                      ? currentGame.isActive
+                        ? "Game Started"
+                        : "Waiting for players to join..."
+                      : endedForMode
+                        ? "Game Ended"
+                        : "Waiting for players to join...";
+                    const statusClass = currentGame
+                      ? currentGame.isActive
+                        ? "started"
+                        : "waiting"
+                      : endedForMode
+                        ? "ended"
+                        : "waiting";
+
+                    return (
+                      <button
+                        key={mode.label}
+                        type="button"
+                        className={`mode-card mode-card-${statusClass}`}
+                        onClick={async () => {
+                          setSelectedMode(mode);
+                          setSelectedGameId(null);
+                          const resolvedGameId = await resolveGameIdForMode(mode);
+                          if (resolvedGameId != null) {
+                            setSelectedGameId(resolvedGameId);
+                          }
+                          setShowLanding(false);
+                        }}
+                      >
+                        <span className="mode-card-top">
+                          <span className="mode-card-title">{mode.label}</span>
+                          <span className="mode-card-id">ID {gameIdLabel}</span>
+                        </span>
+                        <span className="mode-card-sub">
+                          Fee: {(mode.registrationFeeLamports / LAMPORTS_PER_SOL).toFixed(3)} SOL
+                        </span>
+                        <span className={`mode-card-status ${statusClass}`}>{statusLabel}</span>
+                      </button>
+                    );
+                  })()
+                ))}
+              </div>
+            </div>
           </div>
 
           <aside className="landing-leaderboard">
-            <h3>Top 5 Leaderboard</h3>
+            <h3>Leaderboard – Top 5</h3>
             {leaderboardLoading && <div className="landing-leaderboard-empty">Loading...</div>}
             {!leaderboardLoading && leaderboardError && (
               <div className="landing-leaderboard-empty">{leaderboardError}</div>
@@ -1070,7 +1444,7 @@ const App: React.FC = () => {
           {myPlayerId ? (
             <span
               className="badge"
-              style={{ background: PLAYER_COLORS[myPlayerId - 1] }}
+              style={{ background: PLAYER_COLORS[(myPlayerId - 1) % PLAYER_COLORS.length] }}
             >
               Player {myPlayerId} · Score: {myScore}
             </span>
@@ -1079,7 +1453,7 @@ const App: React.FC = () => {
           ) : (
             <span className="badge inactive">Not registered</span>
           )}
-          {publicKey && gameStatus?.currentGameId != null && !gameStatus?.isActive && !myPlayerId && (gameStatus?.playersCount ?? 0) < 2 && (
+          {publicKey && gameStatus?.currentGameId != null && !gameStatus?.isActive && !myPlayerId && (gameStatus?.playersCount ?? 0) < maxPlayers && (
             <button
               type="button"
               className="btn-register"
@@ -1090,7 +1464,7 @@ const App: React.FC = () => {
                 ? "Funding session…"
                 : registerPending
                   ? "Registering…"
-                  : `Register (${REGISTRATION_FEE_LAMPORTS / LAMPORTS_PER_SOL} SOL)`}
+                  : `Register (${(registrationFeeLamports / LAMPORTS_PER_SOL).toFixed(3)} SOL)`}
             </button>
           )}
         </div>
@@ -1124,48 +1498,55 @@ const App: React.FC = () => {
             )}
           </div>
 
-          {gameStatus?.lastCompletedGame && (
+          {settlement && (
             <div className="panel-section">
-              <h3>Last Settlement</h3>
+              <h3>Settlement Details</h3>
               <div className="status-row">
-                <span className="label">Game ID:</span>
-                <span className="value">{gameStatus.lastCompletedGame.currentGameId}</span>
+                <span className="label">Current Game ID:</span>
+                <span className="value">{settlement.currentGameId}</span>
               </div>
-              {gameStatus.lastCompletedGame.txTrace.rewardTxSolscanUrl ? (
+              {settlement.txTrace.rewardTxSolscanUrl ? (
                 <div className="status-row">
                   <span className="label">Payout Tx:</span>
                   <a
                     className="value mono"
-                    href={gameStatus.lastCompletedGame.txTrace.rewardTxSolscanUrl}
+                    href={settlement.txTrace.rewardTxSolscanUrl}
                     target="_blank"
                     rel="noreferrer"
                   >
                     Solscan link
                   </a>
                 </div>
+              ) : settlement.txTrace.rewardTxHash ? (
+                <div className="status-row">
+                  <span className="label">Payout Tx:</span>
+                  <span className="value mono">
+                    {settlement.txTrace.rewardTxHash.slice(0, 10)}... (confirmed)
+                  </span>
+                </div>
               ) : (
                 <div className="status-row">
                   <span className="label">Payout Tx:</span>
                   <span className="value">
-                    {gameStatus.lastCompletedGame.txTrace.rewardError
+                    {settlement.txTrace.rewardError
                       ? "Failed (see relayer logs)"
                       : "Pending confirmation"}
                   </span>
                 </div>
               )}
-              {gameStatus.lastCompletedGame.txTrace.startSessionTxHash && (
+              {settlement.txTrace.startSessionTxHash && (
                 <div className="status-row">
                   <span className="label">Start Tx:</span>
                   <span className="value mono">
-                    {gameStatus.lastCompletedGame.txTrace.startSessionTxHash.slice(0, 10)}...
+                    {settlement.txTrace.startSessionTxHash.slice(0, 10)}...
                   </span>
                 </div>
               )}
-              {gameStatus.lastCompletedGame.txTrace.delegateBoardTxHash && (
+              {settlement.txTrace.delegateBoardTxHash && (
                 <div className="status-row">
                   <span className="label">Delegate Tx:</span>
                   <span className="value mono">
-                    {gameStatus.lastCompletedGame.txTrace.delegateBoardTxHash.slice(0, 10)}...
+                    {settlement.txTrace.delegateBoardTxHash.slice(0, 10)}...
                   </span>
                 </div>
               )}
@@ -1182,14 +1563,14 @@ const App: React.FC = () => {
                 className={`player-card ${
                   myPlayerId === p.id ? "me" : ""
                 }`}
-                style={{ borderLeftColor: PLAYER_COLORS[i] }}
+                style={{ borderLeftColor: PLAYER_COLORS[i % PLAYER_COLORS.length] }}
               >
                 <div className="player-top">
                   <span
                     className="player-label"
-                    style={{ color: PLAYER_COLORS[i] }}
+                    style={{ color: PLAYER_COLORS[i % PLAYER_COLORS.length] }}
                   >
-                    {PLAYER_LABELS[i]}
+                    {PLAYER_LABELS[i] ?? `P${p.id}`}
                     {Number(p.powerupScore ?? 0) > 0 && (
                       <span className="player-power-badge" title="Power charged!"> ⚡</span>
                     )}
@@ -1223,13 +1604,14 @@ const App: React.FC = () => {
           <div className="grid-wrapper">
             <div
               className="grid"
-              style={{ gridTemplateColumns: `repeat(${COLS}, 1fr)` }}
+              style={{ gridTemplateColumns: `repeat(${boardSideLen}, 1fr)` }}
             >
               {flatBoard.map((cell, idx) => {
                 let cls = "cell";
                 let content: React.ReactNode = null;
+                let inlineStyle: React.CSSProperties | undefined;
 
-                const isPlayer = cell >= 1 && cell <= 4;
+                const isPlayer = cell >= 1 && cell <= maxPlayers;
                 const isKingTile = kingTileIndex != null && idx === kingTileIndex;
                 const isPowerupTile = cell === POWERUP_MARK;
                 const isBombTile = cell === BOMB_MARK;
@@ -1243,10 +1625,18 @@ const App: React.FC = () => {
                   if (myPlayerId === cell) cls += " me";
                   if (isKingTile) cls += " king-occupied";
                   if (isBeamHit) cls += " beam-hit";
+                  if (cell > 4) {
+                    const color = PLAYER_COLORS[(cell - 1) % PLAYER_COLORS.length];
+                    inlineStyle = {
+                      background: `${color}40`,
+                      borderColor: color,
+                      color,
+                    };
+                  }
                   content = (
                     <>
                       {isKingTile && <span className="cell-king-corner">👑</span>}
-                      {PLAYER_LABELS[cell - 1]}
+                      {PLAYER_LABELS[cell - 1] ?? `P${cell}`}
                     </>
                   );
                 } else if (cell === KING_MARK) {
@@ -1270,7 +1660,11 @@ const App: React.FC = () => {
                   <div
                     key={idx}
                     className={cls}
-                    style={isBeamCell ? { "--beam-idx": beamIdx } as React.CSSProperties : undefined}
+                    style={
+                      isBeamCell
+                        ? ({ ...(inlineStyle ?? {}), "--beam-idx": beamIdx } as React.CSSProperties)
+                        : inlineStyle
+                    }
                   >
                     {content}
                   </div>
@@ -1308,10 +1702,10 @@ const App: React.FC = () => {
                 <div className="dpad-group">
                   <div className="dpad-group-label">Move</div>
                   <div className="dpad">
-                    <button className="dpad-btn up" onClick={() => makeMove(-12)}>W</button>
+                    <button className="dpad-btn up" onClick={() => makeMove(-boardSideLen)}>W</button>
                     <div className="dpad-mid">
                       <button className="dpad-btn left" onClick={() => makeMove(-1)}>A</button>
-                      <button className="dpad-btn down" onClick={() => makeMove(12)}>S</button>
+                      <button className="dpad-btn down" onClick={() => makeMove(boardSideLen)}>S</button>
                       <button className="dpad-btn right" onClick={() => makeMove(1)}>D</button>
                     </div>
                   </div>
@@ -1321,10 +1715,10 @@ const App: React.FC = () => {
                 <div className="dpad-group">
                   <div className="dpad-group-label">Power ⚡</div>
                   <div className={`dpad ${myPowerupScore > 0 ? "dpad-powered" : "dpad-dim"}`}>
-                    <button className="dpad-btn up power-btn" onClick={() => usePower(-12)}>▲</button>
+                    <button className="dpad-btn up power-btn" onClick={() => usePower(-boardSideLen)}>▲</button>
                     <div className="dpad-mid">
                       <button className="dpad-btn left power-btn" onClick={() => usePower(-1)}>◄</button>
-                      <button className="dpad-btn down power-btn" onClick={() => usePower(12)}>▼</button>
+                      <button className="dpad-btn down power-btn" onClick={() => usePower(boardSideLen)}>▼</button>
                       <button className="dpad-btn right power-btn" onClick={() => usePower(1)}>►</button>
                     </div>
                   </div>
@@ -1339,9 +1733,9 @@ const App: React.FC = () => {
             </div>
           )}
 
-          {publicKey && !gameStatus?.isActive && gameStatus?.currentGameId !== null && (gameStatus?.playersCount ?? 0) < 2 && (
+          {publicKey && !gameStatus?.isActive && gameStatus?.currentGameId !== null && (gameStatus?.playersCount ?? 0) < maxPlayers && (
             <div className="connect-prompt">
-              Waiting for 2 players. Connect a second wallet and click <b>Register</b> above to start.
+              Waiting for {maxPlayers} players. Ask others to connect and click <b>Register</b> above to start.
             </div>
           )}
 
@@ -1354,7 +1748,7 @@ const App: React.FC = () => {
           {/* Fallback game-over panel visible after page refresh (no modal) */}
           {!showGameOverModal &&
             displayGame?.isActive === false &&
-            (displayGame?.playersCount ?? 0) >= 2 &&
+            (displayGame?.playersCount ?? 0) >= maxPlayers &&
             (displayGame?.gameEndTimestamp ?? 0) > 0 &&
             Math.floor(Date.now() / 1000) >= (displayGame?.gameEndTimestamp ?? 0) && (
               <div className="game-over">
@@ -1366,8 +1760,8 @@ const App: React.FC = () => {
                     ?.map((p, i) => (
                       <div key={i} className="final-row">
                         <span>{i === 0 ? "🥇" : i === 1 ? "🥈" : "🥉"}</span>
-                        <span style={{ color: PLAYER_COLORS[p.id - 1] }}>
-                          {PLAYER_LABELS[p.id - 1]}
+                        <span style={{ color: PLAYER_COLORS[(p.id - 1) % PLAYER_COLORS.length] }}>
+                          {PLAYER_LABELS[p.id - 1] ?? `P${p.id}`}
                         </span>
                         <span className="final-score">{p.score} pts</span>
                       </div>
