@@ -57,6 +57,13 @@ type ActiveGameSummary = {
   gameEndTimestamp?: number;
 };
 
+type GamesOverviewResponse = {
+  ok?: boolean;
+  activeGames?: ActiveGameSummary[];
+  lastCompletedGame?: CompletedGameSnapshot | null;
+  lastCompletedByMode?: Record<string, CompletedGameSnapshot>;
+};
+
 const GAME_MODES: GameMode[] = [
   {
     label: "8x8 - 2 Players",
@@ -80,6 +87,62 @@ const GAME_MODES: GameMode[] = [
     lamportsPerScore: 18_000,
   },
 ];
+
+const modeKey = (boardSideLen: number, maxPlayers: number): string =>
+  `${boardSideLen}x${maxPlayers}`;
+
+const modeKeyFromMode = (
+  mode: Pick<GameMode, "boardSideLen" | "maxPlayers">
+): string => modeKey(Number(mode.boardSideLen), Number(mode.maxPlayers));
+
+const modeKeyFromSnapshot = (
+  snapshot: Pick<CompletedGameSnapshot, "boardSideLen" | "maxPlayers">
+): string | null => {
+  const boardSideLen = Number(snapshot.boardSideLen ?? Number.NaN);
+  const maxPlayers = Number(snapshot.maxPlayers ?? Number.NaN);
+  if (!Number.isFinite(boardSideLen) || !Number.isFinite(maxPlayers)) return null;
+  return modeKey(boardSideLen, maxPlayers);
+};
+
+const completedSnapshotRank = (
+  snapshot: Pick<CompletedGameSnapshot, "completedAtIso" | "currentGameId">
+): number => {
+  const completedAtMs = Date.parse(snapshot.completedAtIso ?? "");
+  if (Number.isFinite(completedAtMs)) return completedAtMs;
+  const gameId = Number(snapshot.currentGameId ?? Number.NaN);
+  return Number.isFinite(gameId) ? gameId : 0;
+};
+
+const mergeCompletedByMode = (
+  base: Record<string, CompletedGameSnapshot>,
+  incoming: Record<string, CompletedGameSnapshot>
+): Record<string, CompletedGameSnapshot> => {
+  const merged = { ...base };
+  for (const [key, snapshot] of Object.entries(incoming)) {
+    if (!snapshot) continue;
+    const existing = merged[key];
+    if (!existing || completedSnapshotRank(snapshot) >= completedSnapshotRank(existing)) {
+      merged[key] = snapshot;
+    }
+  }
+  return merged;
+};
+
+const extractCompletedByMode = (
+  data: GamesOverviewResponse
+): Record<string, CompletedGameSnapshot> => {
+  let byMode: Record<string, CompletedGameSnapshot> = {};
+  if (data?.lastCompletedByMode && typeof data.lastCompletedByMode === "object") {
+    byMode = mergeCompletedByMode(byMode, data.lastCompletedByMode);
+  }
+  if (data?.lastCompletedGame) {
+    const fallbackKey = modeKeyFromSnapshot(data.lastCompletedGame);
+    if (fallbackKey) {
+      byMode = mergeCompletedByMode(byMode, { [fallbackKey]: data.lastCompletedGame });
+    }
+  }
+  return byMode;
+};
 
 // Returns the board cell indices the power beam travels through, starting from
 // fromPos stepping by direction until it hits a board edge (or a player).
@@ -148,8 +211,8 @@ const App: React.FC = () => {
   const [selectedMode, setSelectedMode] = useState<GameMode | null>(null);
   const [selectedGameId, setSelectedGameId] = useState<number | null>(null);
   const [activeGames, setActiveGames] = useState<ActiveGameSummary[]>([]);
-  const [lastCompletedFromGames, setLastCompletedFromGames] =
-    useState<CompletedGameSnapshot | null>(null);
+  const [lastCompletedByMode, setLastCompletedByMode] =
+    useState<Record<string, CompletedGameSnapshot>>({});
   const [leaderboard, setLeaderboard] = useState<LeaderboardRow[]>([]);
   const [leaderboardLoading, setLeaderboardLoading] = useState(true);
   const [leaderboardError, setLeaderboardError] = useState<string | null>(null);
@@ -188,14 +251,24 @@ const App: React.FC = () => {
   const { playLaserSound } = useLaserSound(0.15);
   const { playBombSound } = useBombSound(0.17);
 
+  const selectedModeKey = useMemo(
+    () => (selectedMode ? modeKeyFromMode(selectedMode) : null),
+    [selectedMode]
+  );
+
+  const selectedModeCompleted = useMemo(() => {
+    if (!selectedModeKey) return null;
+    return lastCompletedByMode[selectedModeKey] ?? null;
+  }, [lastCompletedByMode, selectedModeKey]);
+
   const displayGame = useMemo<CompletedGameSnapshot | GameStatus | null>(() => {
     if (gameStatus?.currentGameId !== null) return gameStatus;
     if (gameStatus?.lastCompletedGame) return gameStatus.lastCompletedGame;
-    return lastCompletedFromGames ?? null;
-  }, [gameStatus, lastCompletedFromGames]);
+    return selectedModeCompleted ?? null;
+  }, [gameStatus, selectedModeCompleted]);
 
   useEffect(() => {
-    const snapshots = [gameStatus?.lastCompletedGame, lastCompletedFromGames];
+    const snapshots = [gameStatus?.lastCompletedGame, selectedModeCompleted];
     for (const snapshot of snapshots) {
       if (!snapshot) continue;
       const gameId = Number(snapshot.currentGameId);
@@ -209,7 +282,7 @@ const App: React.FC = () => {
         rewardTxSolscanUrl: rewardTxSolscanUrl ?? existing?.rewardTxSolscanUrl,
       });
     }
-  }, [gameStatus?.lastCompletedGame, lastCompletedFromGames]);
+  }, [gameStatus?.lastCompletedGame, selectedModeCompleted]);
 
   const settlementTargetGameId = useMemo<number | null>(() => {
     const activeGameId = Number(gameStatus?.currentGameId ?? Number.NaN);
@@ -220,7 +293,7 @@ const App: React.FC = () => {
   }, [gameStatus?.currentGameId, selectedGameId]);
 
   const settlement = useMemo<CompletedGameSnapshot | null>(() => {
-    const candidates = [gameStatus?.lastCompletedGame, lastCompletedFromGames].filter(
+    const candidates = [gameStatus?.lastCompletedGame, selectedModeCompleted].filter(
       (snapshot): snapshot is CompletedGameSnapshot => !!snapshot
     );
     if (!candidates.length) return null;
@@ -256,7 +329,7 @@ const App: React.FC = () => {
           rewardTxHash || rewardTxSolscanUrl ? undefined : mergedTxTrace.rewardError,
       },
     };
-  }, [gameStatus?.lastCompletedGame, lastCompletedFromGames, settlementTargetGameId]);
+  }, [gameStatus?.lastCompletedGame, selectedModeCompleted, settlementTargetGameId]);
 
   const myPlayerId = useMemo(() => {
     if (!sessionKeypair || !displayGame?.players) return null;
@@ -716,13 +789,14 @@ const App: React.FC = () => {
   const fetchGamesOverview = useCallback(async (): Promise<ActiveGameSummary[]> => {
     try {
       const res = await fetch(`${RELAYER_URL}/games`);
-      const data = await res.json();
+      const data: GamesOverviewResponse = await res.json();
       if (!res.ok || data?.ok === false) return [];
       const games: ActiveGameSummary[] = Array.isArray(data?.activeGames)
         ? data.activeGames
         : [];
+      const completedByMode = extractCompletedByMode(data);
       setActiveGames(games);
-      setLastCompletedFromGames((data?.lastCompletedGame as CompletedGameSnapshot) ?? null);
+      setLastCompletedByMode((prev) => mergeCompletedByMode(prev, completedByMode));
       return games;
     } catch {
       return [];
@@ -732,25 +806,33 @@ const App: React.FC = () => {
   const resolveGameIdForMode = useCallback(
     async (mode: GameMode): Promise<number | null> => {
       const localMatches = findModeGames(mode, activeGames);
+      const modeLookupKey = modeKeyFromMode(mode);
       if (localMatches.length > 0) {
         return Number(localMatches[0].gameId);
       }
+      const localCompleted = lastCompletedByMode[modeLookupKey];
+      if (localCompleted) {
+        return Number(localCompleted.currentGameId);
+      }
       try {
         const res = await fetch(`${RELAYER_URL}/games`);
-        const data = await res.json();
+        const data: GamesOverviewResponse = await res.json();
         if (!res.ok || data?.ok === false) return null;
-        const activeGames: ActiveGameSummary[] = Array.isArray(data?.activeGames)
+        const nextActiveGames: ActiveGameSummary[] = Array.isArray(data?.activeGames)
           ? data.activeGames
           : [];
-        setActiveGames(activeGames);
-        setLastCompletedFromGames((data?.lastCompletedGame as CompletedGameSnapshot) ?? null);
-        const matches = findModeGames(mode, activeGames);
-        return matches.length > 0 ? Number(matches[0].gameId) : null;
+        const completedByMode = extractCompletedByMode(data);
+        setActiveGames(nextActiveGames);
+        setLastCompletedByMode((prev) => mergeCompletedByMode(prev, completedByMode));
+        const matches = findModeGames(mode, nextActiveGames);
+        if (matches.length > 0) return Number(matches[0].gameId);
+        const remoteCompleted = completedByMode[modeLookupKey];
+        return remoteCompleted ? Number(remoteCompleted.currentGameId) : null;
       } catch {
         return null;
       }
     },
-    [activeGames, findModeGames]
+    [activeGames, findModeGames, lastCompletedByMode]
   );
 
   const refetchGameStatus = useCallback(async () => {
@@ -1341,12 +1423,7 @@ const App: React.FC = () => {
                   (() => {
                     const modeGames = findModeGames(mode, activeGames);
                     const currentGame = modeGames.length > 0 ? modeGames[0] : null;
-                    const endedForMode =
-                      lastCompletedFromGames &&
-                      Number(lastCompletedFromGames.boardSideLen) === mode.boardSideLen &&
-                      Number(lastCompletedFromGames.maxPlayers) === mode.maxPlayers
-                        ? lastCompletedFromGames
-                        : null;
+                    const endedForMode = lastCompletedByMode[modeKeyFromMode(mode)] ?? null;
 
                     const gameIdLabel = currentGame
                       ? String(currentGame.gameId)
@@ -1360,7 +1437,7 @@ const App: React.FC = () => {
                         : "Waiting for players to join..."
                       : endedForMode
                         ? "Game Ended"
-                        : "Waiting for players to join...";
+                        : "Game not started";
                     const statusClass = currentGame
                       ? currentGame.isActive
                         ? "started"
@@ -1448,8 +1525,10 @@ const App: React.FC = () => {
             >
               Player {myPlayerId} · Score: {myScore}
             </span>
-          ) : gameStatus?.currentGameId == null ? (
+          ) : displayGame?.currentGameId == null ? (
             <span className="badge inactive">Game not started</span>
+          ) : displayGame?.isActive === false && Number(displayGame?.gameEndTimestamp ?? 0) > 0 ? (
+            <span className="badge inactive">Game ended</span>
           ) : (
             <span className="badge inactive">Not registered</span>
           )}

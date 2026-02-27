@@ -107,6 +107,46 @@ export async function bootstrapRelayer(): Promise<void> {
   const INACTIVE_STATUS_CACHE_TTL_MS = 1_500;
   const WATCHDOG_INTERVAL_MS = 5_000;
 
+  const toCompletedModeKey = (
+    snapshot: Pick<CompletedGameSnapshot, "boardSideLen" | "maxPlayers">
+  ): string | null => {
+    const boardSideLen = Number(snapshot.boardSideLen ?? Number.NaN);
+    const maxPlayers = Number(snapshot.maxPlayers ?? Number.NaN);
+    if (!Number.isFinite(boardSideLen) || !Number.isFinite(maxPlayers)) return null;
+    return `${boardSideLen}x${maxPlayers}`;
+  };
+
+  const completedSnapshotRank = (
+    snapshot: Pick<CompletedGameSnapshot, "completedAtIso" | "currentGameId">
+  ): number => {
+    const completedAtMs = Date.parse(snapshot.completedAtIso ?? "");
+    if (Number.isFinite(completedAtMs)) return completedAtMs;
+    const gameId = Number(snapshot.currentGameId ?? Number.NaN);
+    return Number.isFinite(gameId) ? gameId : 0;
+  };
+
+  const upsertLatestCompletedByMode = (
+    byMode: Record<string, CompletedGameSnapshot>,
+    snapshot: CompletedGameSnapshot | null | undefined
+  ): void => {
+    if (!snapshot) return;
+    const key = toCompletedModeKey(snapshot);
+    if (!key) return;
+    const existing = byMode[key];
+    if (!existing || completedSnapshotRank(snapshot) >= completedSnapshotRank(existing)) {
+      byMode[key] = snapshot;
+    }
+  };
+
+  const buildLastCompletedByMode = (): Record<string, CompletedGameSnapshot> => {
+    const byMode: Record<string, CompletedGameSnapshot> = {};
+    for (const snapshot of completedGames.values()) {
+      upsertLatestCompletedByMode(byMode, snapshot);
+    }
+    upsertLatestCompletedByMode(byMode, lastCompletedGame);
+    return byMode;
+  };
+
   const getCachedGameStatusPayload = (gameId: number): Record<string, any> | null => {
     const entry = gameStatusCache.get(gameId);
     if (!entry) return null;
@@ -851,12 +891,14 @@ export async function bootstrapRelayer(): Promise<void> {
       );
 
       activeGames.sort((a, b) => a.gameId - b.gameId);
+      const lastCompletedByMode = buildLastCompletedByMode();
 
       res.json({
         ok: true,
         activeGames,
         activeGameIds: activeGames.map((g) => g.gameId),
         lastCompletedGame,
+        lastCompletedByMode,
       });
     } catch (error: any) {
       res.status(500).json({
