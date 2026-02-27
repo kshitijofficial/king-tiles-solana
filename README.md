@@ -5,7 +5,7 @@ Turnless mini-game on Solana + Magicblock: players register on **devnet**, gamep
 ## 🎥 Demo Video
 
 👉 **Watch King Tiles in action:**  
-https://youtu.be/7BOSDaF4Ttw?si=KuipppdBiuSgdcNX
+https://youtu.be/1h1W_XZjDcI
 
 ### 🔥 Highlights
 
