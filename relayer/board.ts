@@ -15,11 +15,10 @@ export function getBoardPDA(
   );
 }
 
-export function toBoardGrid(flat: Uint8Array): number[][] {
-  const COLS = 12;
+export function toBoardGrid(flat: Uint8Array, cols: number): number[][] {
   const flatBoard: number[] = Array.from(flat);
-  return Array.from({ length: COLS }, (_, row) =>
-    flatBoard.slice(row * COLS, row * COLS + COLS)
+  return Array.from({ length: cols }, (_, row) =>
+    flatBoard.slice(row * cols, row * cols + cols)
   );
 }
 
@@ -35,6 +34,10 @@ export function toBoardStatusPayload(
     source,
     currentGameId: gameId,
     boardPDA: boardPDA.toBase58(),
+    boardSideLen: Number(board.boardSideLen),
+    maxPlayers: Number(board.maxPlayers),
+    registrationFeeLamports: board.registrationFeeLamports.toString(),
+    lamportsPerScore: board.lamportsPerScore.toString(),
     playersCount: Number(board.playersCount),
     isActive: !!board.isActive,
     gameEndTimestamp,
@@ -46,8 +49,14 @@ export function toBoardStatusPayload(
       currentPosition: Number(p.currentPosition),
       powerupScore: p.powerupScore.toString(),
     })),
-    board: toBoardGrid(board.board),
-    boardLegend: { 0: "empty", "1-4": "player id", 5: "king", 6: "powerup", 7: "bomb" },
+    board: toBoardGrid(board.board, Number(board.boardSideLen)),
+    boardLegend: {
+      0: "empty",
+      "1-max": "player id",
+      253: "bomb",
+      254: "powerup",
+      255: "king",
+    },
   };
 }
 

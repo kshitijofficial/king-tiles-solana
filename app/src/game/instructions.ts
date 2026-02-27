@@ -32,13 +32,13 @@ export function buildMakeMoveIx(
   boardPDA: PublicKey,
   gameId: number,
   playerId: number,
-  movePosition: number
+  directionVariant: number
 ): TransactionInstruction {
-  const data = Buffer.alloc(8 + 8 + 1 + 2);
+  const data = Buffer.alloc(8 + 8 + 1 + 1);
   Buffer.from(MAKE_MOVE_DISCRIMINATOR).copy(data, 0);
   data.writeBigUInt64LE(BigInt(gameId), 8);
   data.writeUInt8(playerId, 16);
-  data.writeInt16LE(movePosition, 17);
+  data.writeUInt8(directionVariant, 17);
 
   return new TransactionInstruction({
     keys: [
@@ -50,4 +50,3 @@ export function buildMakeMoveIx(
     data,
   });
 }
-

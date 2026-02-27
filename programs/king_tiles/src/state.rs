@@ -18,9 +18,30 @@ pub struct Player {
     pub current_position: i16,
     /// 1-based id used as the board cell marker.
     pub id: u8,
-   
+
     /// Power up accrued over time while occupying the powerup tile.
     pub powerup_score: u64,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+/// Orthogonal movement directions.
+pub enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl Direction {
+    pub fn offset(self, board_side_len: u8) -> i16 {
+        let side = board_side_len as i16;
+        match self {
+            Direction::Right => 1,
+            Direction::Left => -1,
+            Direction::Down => side,
+            Direction::Up => -side,
+        }
+    }
 }
 
 #[account]
@@ -30,11 +51,20 @@ pub struct Board {
     /// Client-defined identifier used to derive the board PDA.
     pub game_id: u64,
     /// Player slots (only the first `players_count` entries are active).
-    pub players: [Player; 4],
+    #[max_len(6)]
+    pub players: Vec<Player>,
     /// Whether the game is currently active (started and not yet ended).
     pub is_active: bool,
     /// Flat board array of length [`BOARD_SIZE`].
     pub board: [u8; BOARD_SIZE],
+    /// Logical board side length (8, 10, or 12).
+    pub board_side_len: u8,
+    /// Number of players required to start and cap registrations.
+    pub max_players: u8,
+    /// Per-player registration fee for this game.
+    pub registration_fee_lamports: u64,
+    /// Reward paid per score point for this game.
+    pub lamports_per_score: u64,
     /// Number of registered players.
     pub players_count: u8,
     /// Current king tile index.
@@ -48,4 +78,12 @@ pub struct Board {
     pub powerup_current_position: u8,
     /// Current bomb tile index.
     pub bomb_current_position: u8,
+}
+
+impl Board {
+    #[inline(always)]
+    pub fn active_board_cells(&self) -> usize {
+        let side = self.board_side_len as usize;
+        side.checked_mul(side).unwrap()
+    }
 }

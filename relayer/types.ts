@@ -13,6 +13,10 @@ export type BoardStatusPayload = {
   source: string;
   currentGameId: number;
   boardPDA: string;
+  boardSideLen: number;
+  maxPlayers: number;
+  registrationFeeLamports: string;
+  lamportsPerScore: string;
   playersCount: number;
   isActive: boolean;
   gameEndTimestamp: number;
@@ -25,7 +29,7 @@ export type BoardStatusPayload = {
     powerupScore: string;
   }>;
   board: number[][];
-  boardLegend: { 0: string; "1-4": string; 5: string; 6: string; 7: string };
+  boardLegend: { 0: string; "1-max": string; 253: string; 254: string; 255: string };
 };
 
 export type CompletedGameSnapshot = BoardStatusPayload & {
